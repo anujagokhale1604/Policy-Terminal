@@ -1,100 +1,88 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import numpy as np
-from scipy.stats import pearsonr
 
-# --- PAGE CONFIG ---
-st.set_page_config(page_title="Macro Policy Lab", layout="wide", page_icon="📈")
+# --- SETUP ---
+st.set_page_config(page_title="Macro-Quant Strategy Terminal", layout="wide")
 
-# --- STYLING ---
-st.markdown("""
-    <style>
-    .main { background-color: #f8f9fa; }
-    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; border: 1px solid #e0e0e0; }
-    .analysis-note { background-color: #ffffff; padding: 20px; border-left: 5px solid #002d72; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-    </style>
-    """, unsafe_allow_html=True)
-
-# --- LOAD DATA ---
+# --- 1. DATA LOADING ---
 @st.cache_data
 def load_data():
-    df = pd.read_csv('EM_Macro_Data_India_SG_UK.xlsx - Macro data.csv')
-    df['Date'] = pd.to_datetime(df['Date'])
+    # Loading your specific xlsx sheets
+    df_macro = pd.read_excel("EM_Macro_Data_India_SG_UK.xlsx", sheet_name="Macro data")
+    df_gdp = pd.read_excel("EM_Macro_Data_India_SG_UK.xlsx", sheet_name="GDP_Growth", header=1)
+    
+    # Cleaning Date
+    df_macro['Date'] = pd.to_datetime(df_macro['Date'])
+    df_macro.set_index('Date', inplace=True)
+    
+    # Merging GDP (Annual) into Macro (Monthly) for Taylor Rule calculation
+    # We use 'ffill' to spread annual growth across months for the model
+    df_gdp['Date'] = pd.to_datetime(df_gdp.iloc[:, 0], format='%Y')
+    df_gdp.set_index('Date', inplace=True)
+    df = df_macro.join(df_gdp, how='left').fillna(method='ffill')
     return df
 
-try:
-    df = load_data()
-except Exception as e:
-    st.error("Data file not found. Please ensure the CSV is in the same folder.")
-    st.stop()
+df = load_data()
 
-# --- SIDEBAR CONTROLS ---
-st.sidebar.title("🕹️ Control Panel")
-market = st.sidebar.selectbox("Select Market", ["India", "UK", "Singapore"])
+# --- 2. SIDEBAR CONTROLS (Snippet #1 Location) ---
+st.sidebar.title("🛠️ Strategy & Stress-Testing")
+country = st.sidebar.selectbox("Select Country", ["India", "Singapore", "UK"])
 
-st.sidebar.divider()
-st.sidebar.subheader("Taylor Rule Settings")
-target_inf = st.sidebar.slider("Inflation Target (%)", 0.0, 6.0, 4.0 if market == "India" else 2.0)
-r_star = st.sidebar.slider("Neutral Rate (r*)", 0.0, 5.0, 1.5)
+energy_shock = st.sidebar.slider("Energy Price Surge (%)", 0, 100, 0)
+target_inf = st.sidebar.number_input("Target Inflation (%)", value=4.0 if country == "India" else 2.0)
+stance = st.sidebar.select_slider("Central Bank Stance", options=["Dovish", "Neutral", "Hawkish"], value="Neutral")
 
-st.sidebar.divider()
-st.sidebar.subheader("⚠️ Stress Test")
-oil_shock = st.sidebar.slider("Energy Price Spike (%)", 0, 100, 0)
-
-# --- MODEL LOGIC ---
-m_map = {
-    "India": {"cpi": "CPI_India", "rate": "Policy_India", "beta": 0.12},
-    "UK": {"cpi": "CPI_UK", "rate": "Policy_UK", "beta": 0.07},
-    "Singapore": {"cpi": "CPI_Singapore", "rate": "Policy_Singapore", "beta": 0.10}
+# --- 3. ECONOMIC ENGINE (Snippet #2 Location) ---
+# Map titles to your exact file headers
+map_cols = {
+    "India": {"cpi": "CPI_India", "policy": "Policy_India", "gdp": "IND.1"},
+    "Singapore": {"cpi": "CPI_Singapore", "policy": "Policy_Singapore", "gdp": "SGP"},
+    "UK": {"cpi": "CPI_UK", "policy": "Policy_UK", "gdp": "GBR"}
 }
-m = m_map[market]
+c = map_cols[country]
 
-current_inf = df[m['cpi']].iloc[-1]
-shock_impact = oil_shock * m['beta']
-adj_inf = current_inf + shock_impact
-current_rate = df[m['rate']].iloc[-1]
+# Calculate logic
+df['Shocked_Inflation'] = df[c['cpi']] + (energy_shock * 0.12)
+weights = {"Dovish": {"pi": 1.2, "y": 1.0}, "Neutral": {"pi": 1.5, "y": 0.5}, "Hawkish": {"pi": 2.0, "y": 0.25}}
+w = weights[stance]
+neutral_rate = 2.5 
 
-# Taylor Rule: i = r* + pi + 0.5(pi - target)
-suggested_rate = r_star + adj_inf + 0.5 * (adj_inf - target_inf)
+df['Taylor_Rate'] = (neutral_rate + df['Shocked_Inflation'] + 
+                     w['pi'] * (df['Shocked_Inflation'] - target_inf) + 
+                     w['y'] * df[c['gdp']])
+df['Policy_Gap'] = df[c['policy']] - df['Taylor_Rate']
 
-# --- DASHBOARD LAYOUT ---
-st.title(f"🏦 {market}: Monetary Policy Analysis")
-st.caption("Quantitative Research Terminal for Interest Rate Projections")
+# --- 4. VISUALIZATION (Snippet #3 Location) ---
+st.title(f"Macroeconomic Strategy Terminal: {country}")
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Headline CPI", f"{current_inf:.2f}%")
-col2.metric("Adj. CPI (Shock)", f"{adj_inf:.2f}%", delta=f"+{shock_impact:.2f}%" if oil_shock > 0 else None, delta_color="inverse")
-col3.metric("Actual Policy Rate", f"{current_rate:.2f}%")
-col4.metric("Taylor Fair Value", f"{suggested_rate:.2f}%", delta=f"{(suggested_rate-current_rate):.2f}%", delta_color="inverse")
-
-# --- CHART ---
 fig = go.Figure()
-fig.add_trace(go.Scatter(x=df['Date'], y=df[m['cpi']], name="Inflation", line=dict(color="#d32f2f", width=1.5, dash='dot')))
-fig.add_trace(go.Scatter(x=df['Date'], y=df[m['rate']], name="Policy Rate", line=dict(color="#002d72", width=3)))
-fig.add_trace(go.Scatter(x=[df['Date'].iloc[-1]], y=[suggested_rate], mode='markers', marker=dict(size=15, color='#ff9800'), name='Model Suggestion'))
 
-fig.update_layout(height=450, margin=dict(l=0, r=0, t=30, b=0), legend=dict(orientation="h", y=1.1), plot_bgcolor="white")
+# Actual Policy Rate Trace
+fig.add_trace(go.Scatter(x=df.index, y=df[c['policy']], name="Actual Policy Rate", line=dict(color='black', width=3)))
+
+# NEW: Taylor Rule Trace
+fig.add_trace(go.Scatter(x=df.index, y=df['Taylor_Rate'], name="Taylor Rule (Optimal)", line=dict(dash='dash', color='red')))
+
+# NEW: Strategic Shading for Policy Lags
+for i in range(1, len(df)):
+    if df['Policy_Gap'].iloc[i] < -2.0:
+        fig.add_vrect(x0=df.index[i-1], x1=df.index[i], fillcolor="red", opacity=0.1, layer="below", line_width=0)
+
+fig.update_layout(xaxis_title="Date", yaxis_title="Rate (%)", hovermode="x unified")
 st.plotly_chart(fig, use_container_width=True)
 
-# --- RESEARCH NOTE ---
-st.subheader("🧐 Analyst Assessment")
-gap = (suggested_rate - current_rate) * 100
+# --- 5. STRATEGIC BRIEF (Snippet #4 Location) ---
+st.divider()
+st.subheader("📝 Strategic Insight Summary")
+col1, col2 = st.columns(2)
 
-if gap > 50:
-    signal = "HAWKISH"
-    note = f"The model indicates a significant 'Policy Gap' of {gap:.0f} bps. The central bank is likely behind the curve."
-elif gap < -50:
-    signal = "DOVISH"
-    note = f"The current stance appears overly restrictive by {abs(gap):.0f} bps. Conditions favor a pivot toward easing."
-else:
-    signal = "NEUTRAL"
-    note = "Policy is currently well-aligned with the Taylor Rule fair value."
+with col1:
+    latest_gap = df['Policy_Gap'].iloc[-1]
+    st.metric("Current Policy Gap", f"{latest_gap:.2f}%", 
+              delta="Behind Curve" if latest_gap < -1.5 else "Aligned", delta_color="inverse")
 
-st.markdown(f"""
-<div class="analysis-note">
-    <strong>Strategic Bias: {signal}</strong><br><br>
-    {note}<br><br>
-    <em><strong>Interactivity Note:</strong> Move the 'Energy Price Spike' slider to see how supply-side shocks force the Taylor Fair Value (orange dot) higher, requiring a more aggressive policy response.</em>
-</div>
-""", unsafe_allow_html=True)
+with col2:
+    st.write(f"**Key Analytical Takeaways:**")
+    st.write(f"* **Regime Analysis:** Shaded red areas indicate periods of significant policy lag.")
+    st.write(f"* **Scenario:** A {energy_shock}% shock requires a {df['Taylor_Rate'].iloc[-1]:.1f}% terminal rate.")
