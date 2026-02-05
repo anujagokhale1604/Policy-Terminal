@@ -92,33 +92,52 @@ df_full['Taylor_Rate'] = (neutral_rate + df_full['Shocked_Inflation'] +
                           w['pi'] * (df_full['Shocked_Inflation'] - target_inf) + 
                           w['y'] * df_full[c['gdp']])
 
-# --- 5. VISUALIZATION ---
+# --- 5. VISUALIZATION (Updated for better visibility) ---
 st.title(f"Macro-Quant Strategy Terminal: {country}")
-st.write(f"Displaying historical data and predictive modeling through **{future_dates[-1].strftime('%B %Y')}**")
+st.write(f"Historical Data to 2024 | **Model Projection to {future_dates[-1].strftime('%B %Y')}**")
 
 fig = go.Figure()
 
-# Historical Policy Rate
+# Plot Actuals
 fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist[c['policy']], name="Actual Policy Rate", line=dict(color='black', width=3)))
 
-# Taylor Rule: Past (Solid) and Future (Dashed)
+# Plot Taylor Rule (Past + Future)
 df_past_taylor = df_full[df_full['Is_Forecast'] == False]
 df_future_taylor = df_full[df_full['Is_Forecast'] == True]
 
-fig.add_trace(go.Scatter(x=df_past_taylor.index, y=df_past_taylor['Taylor_Rate'], name="Taylor Rule (Historical)", line=dict(color='red')))
-fig.add_trace(go.Scatter(x=df_future_taylor.index, y=df_future_taylor['Taylor_Rate'], name="Taylor Rule (2025/26 Forecast)", line=dict(dash='dash', color='red')))
+fig.add_trace(go.Scatter(x=df_past_taylor.index, y=df_past_taylor['Taylor_Rate'], name="Taylor (Historical)", line=dict(color='red')))
+fig.add_trace(go.Scatter(x=df_future_taylor.index, y=df_future_taylor['Taylor_Rate'], name="Taylor (Forecast Path)", line=dict(dash='dash', color='red', width=3)))
 
-# Prediction Zone Shading
-fig.add_vrect(x0=last_date, x1=future_dates[-1], fillcolor="gray", opacity=0.1, annotation_text="STRATEGIC FORECAST", line_width=0)
+# Forecast Shading
+fig.add_vrect(x0=last_date, x1=future_dates[-1], fillcolor="blue", opacity=0.05, layer="below", line_width=0, annotation_text="FORECAST ZONE")
 
-fig.update_layout(hovermode="x unified", yaxis_title="Rate (%)")
 st.plotly_chart(fig, use_container_width=True)
 
-# --- 6. STRATEGIC INSIGHTS ---
+# --- 6. STRATEGIC SUMMARY (Making Forecast "Seen") ---
 st.divider()
-st.subheader("📝 Forecast Summary")
-col1, col2 = st.columns(2)
+st.subheader("🔮 2025-2026 Forecast Insights")
+
+# Extract specific forecast values
+current_val = df_hist[c['policy']].iloc[-1]
+terminal_forecast = df_full['Taylor_Rate'].iloc[-1]
+avg_forecast_cpi = df_future_taylor[c['cpi']].mean()
+
+col1, col2, col3 = st.columns(3)
+
 with col1:
-    st.metric("Projected Optimal Rate", f"{df_full['Taylor_Rate'].iloc[-1]:.2f}%")
+    st.metric("Current Rate (2024)", f"{current_val:.2f}%")
 with col2:
-    st.write(f"**Strategic Takeaway:** The model predicts that if inflation follows the current trend, {country}'s policy rate should optimally be at **{df_full['Taylor_Rate'].iloc[-1]:.1f}%** by the end of the forecast horizon.")
+    st.metric("Predicted Terminal Rate (2026)", f"{terminal_forecast:.2f}%", 
+              delta=f"{terminal_forecast - current_val:.2f}% Change")
+with col3:
+    st.metric("Avg. Projected Inflation", f"{avg_forecast_cpi:.2f}%")
+
+# --- 7. THE DATA TABLE (The Proof) ---
+with st.expander("📂 View Forecasted Data Points (2025-2026)"):
+    # Displaying the raw predicted numbers so they are 'seen'
+    forecast_display = df_future_taylor[[c['cpi'], c['gdp'], 'Taylor_Rate']].rename(columns={
+        c['cpi']: 'Projected_Inflation',
+        c['gdp']: 'Projected_GDP',
+        'Taylor_Rate': 'Recommended_Policy_Rate'
+    })
+    st.dataframe(forecast_display.style.format("{:.2f}"))
