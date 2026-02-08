@@ -81,12 +81,12 @@ def load_data():
     except: return None
 
 def run_forecast(series, steps):
-    """Predicts future macro trends using Holt-Winters."""
     try:
+        if steps <= 0: return pd.Series([], dtype='float64')
         model = ExponentialSmoothing(series.dropna(), trend='add', seasonal=None).fit()
         return model.forecast(steps)
     except:
-        return np.full(steps, series.iloc[-1])
+        return pd.Series(np.full(steps, series.iloc[-1]))
 
 # --- 3. SIDEBAR ---
 with st.sidebar:
@@ -115,7 +115,7 @@ with st.sidebar:
     st.divider()
     sentiment = st.select_slider("7. MARKET SENTIMENT", options=["Risk-Off", "Neutral", "Risk-On"], value="Neutral")
 
-# --- 4. ANALYTICS & FORECASTING ENGINE ---
+# --- 4. ANALYTICS ---
 df_raw = load_data()
 if df_raw is not None:
     m_map = {
@@ -134,24 +134,22 @@ if df_raw is not None:
     elif scenario == "High Growth 🚀":
         df_hist[m['gdp']] += (4.0 * mult); df_hist[m['cpi']] -= (1.0 * mult)
 
-    # 4.1 FORECAST GENERATION
+    # Forecasting
     last_date = df_hist['Date'].max()
-    future_dates = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=forecast_len, freq='MS')
+    if forecast_len > 0:
+        future_dates = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=forecast_len, freq='MS')
+        df_fore = pd.DataFrame({'Date': future_dates})
+        df_fore[m['cpi']] = run_forecast(df_hist[m['cpi']], forecast_len).values
+        df_fore[m['gdp']] = run_forecast(df_hist[m['gdp']], forecast_len).values
+        df_fore[m['fx']] = run_forecast(df_hist[m['fx']], forecast_len).values
+        df_fore[m['p']] = np.nan
+        df = pd.concat([df_hist, df_fore]).reset_index(drop=True)
+    else:
+        df = df_hist.copy()
     
-    df_fore = pd.DataFrame({'Date': future_dates})
-    df_fore[m['cpi']] = run_forecast(df_hist[m['cpi']], forecast_len).values
-    df_fore[m['gdp']] = run_forecast(df_hist[m['gdp']], forecast_len).values
-    df_fore[m['fx']] = run_forecast(df_hist[m['fx']], forecast_len).values
-    df_fore[m['p']] = np.nan # Policy rate for future is determined by Taylor Rule
-    
-    # 4.2 COMBINE & CALCULATE TAYLOR
-    df = pd.concat([df_hist, df_fore]).reset_index(drop=True)
     df['Is_Forecast'] = df['Date'] > last_date
-    
-    # Apply Energy Shock and Intervention
     df[m['cpi']] += (energy_shock * 0.12)
-    df[m['p']] = df[m['p']].fillna(df[m['p']].ffill()) # Carry last policy rate forward for baseline
-    df[m['p']] += (rate_intervention / 100)
+    df[m['p']] = df[m['p']].ffill() + (rate_intervention / 100)
 
     avg_g = df_hist[m['gdp']].mean()
     df['Taylor'] = m['n'] + 0.5*(df[m['cpi']] - target_inf_val) + 0.5*(df[m['gdp']] - avg_g)
@@ -162,23 +160,19 @@ if df_raw is not None:
     # --- 5. UI RENDERING ---
     st.markdown(f"<div class='main-title'><i class='fas fa-scale-balanced'></i> {market.upper()} STRATEGY TERMINAL</div>", unsafe_allow_html=True)
     
-    # METRICS (Pull from last available row - the forecast terminal)
-    terminal_row = df.iloc[-1]
-    hist_last = df_hist.iloc[-1]
-    
+    # METRICS
+    t_row, h_last = df.iloc[-1], df_hist.iloc[-1]
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("TERMINAL RATE (EXP)", f"{terminal_row['Taylor']:.2f}%", f"{terminal_row['Taylor'] - hist_last[m['p']]:.2f}%")
-    c2.metric("PROJ. INFLATION", f"{terminal_row[m['cpi']]:.2f}%")
-    c3.metric("PROJ. GDP", f"{terminal_row[m['gdp']]:.1f}%")
-    c4.metric(f"FX ({m['sym']})", f"{terminal_row[m['fx']]:.2f}")
+    c1.metric("TERMINAL RATE (EXP)", f"{t_row['Taylor']:.2f}%", f"{t_row['Taylor'] - h_last[m['p']]:.2f}%")
+    c2.metric("PROJ. INFLATION", f"{t_row[m['cpi']]:.2f}%")
+    c3.metric("PROJ. GDP", f"{t_row[m['gdp']]:.1f}%")
+    c4.metric(f"FX ({m['sym']})", f"{t_row[m['fx']]:.2f}")
 
     # CHART I: MONETARY POLICY
     st.markdown("<div class='section-header'><i class='fas fa-chart-line'></i> I. Monetary Policy & FX Transmission (Inc. Forecast)</div>", unsafe_allow_html=True)
     fig1 = make_subplots(specs=[[{"secondary_y": True}]])
     
-    # Historical
-    df_h = df[~df['Is_Forecast']]
-    df_f = df[df['Is_Forecast']]
+    df_h, df_f = df[~df['Is_Forecast']], df[df['Is_Forecast']]
     
     fig1.add_trace(go.Scatter(x=df_h['Date'], y=df_h[m['p']], name="Policy Rate (Hist)", line=dict(color='#002366', width=3)), secondary_y=False)
     
@@ -187,56 +181,34 @@ if df_raw is not None:
         if forecast_len > 0:
             fig1.add_trace(go.Scatter(x=df_f['Date'], y=df_f['Taylor'], name="Taylor (Proj)", line=dict(color='#C5A059', dash='dot', width=3)), secondary_y=False)
 
-    fig1.add_trace(go.Scatter(x=df['Date'], y=df[m['fx']], name="FX Spot", line=dict(color='#2E8B57', opacity=0.5)), secondary_y=True)
+    # FIXED: Opacity moved out of line dict
+    fig1.add_trace(go.Scatter(x=df['Date'], y=df[m['fx']], name="FX Spot", line=dict(color='#2E8B57'), opacity=0.5), secondary_y=True)
     
-    # Shade Forecast Zone
     if forecast_len > 0:
-        fig1.add_vrect(x0=last_date, x1=future_dates[-1], fillcolor="gray", opacity=0.1, line_width=0)
+        fig1.add_vrect(x0=last_date, x1=df['Date'].max(), fillcolor="gray", opacity=0.1, line_width=0)
 
     fig1.update_layout(height=400, template="plotly_white", paper_bgcolor='rgba(0,0,0,0)', margin=dict(l=20, r=20, t=10, b=10), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
     st.plotly_chart(fig1, use_container_width=True)
-
-    # DYNAMIC ANALYST NOTES
-    stance_text = "Hawkish" if terminal_row['Taylor'] > hist_last[m['p']] else "Dovish"
-    st.markdown(f"""<div class='analyst-card'><b>Strategic Forecast:</b> The model projects a <b>{stance_text}</b> path through {future_dates[-1].year if forecast_len > 0 else '2024'}. 
-    Predicted inflation of <b>{terminal_row[m['cpi']]:.1f}%</b> implies the Taylor-optimal rate should settle at <b>{terminal_row['Taylor']:.2f}%</b>.</div>""", unsafe_allow_html=True)
 
     # CHART II: GROWTH & INFLATION
     st.markdown("<div class='section-header'><i class='fas fa-chart-column'></i> II. Real Economy: Growth & Inflation Projections</div>", unsafe_allow_html=True)
     fig2 = make_subplots(specs=[[{"secondary_y": True}]])
     fig2.add_trace(go.Bar(x=df['Date'], y=df[m['gdp']], name="Real GDP Growth", marker_color='#BDB7AB'), secondary_y=False)
     fig2.add_trace(go.Scatter(x=df['Date'], y=df[m['cpi']], name="CPI (YoY)", line=dict(color='#A52A2A', width=3)), secondary_y=True)
+    
     if forecast_len > 0:
-        fig2.add_vrect(x0=last_date, x1=future_dates[-1], fillcolor="gray", opacity=0.1, line_width=0)
+        fig2.add_vrect(x0=last_date, x1=df['Date'].max(), fillcolor="gray", opacity=0.1, line_width=0)
     
     fig2.update_layout(height=400, template="plotly_white", paper_bgcolor='rgba(0,0,0,0)', margin=dict(l=20, r=20, t=10, b=10), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
     st.plotly_chart(fig2, use_container_width=True)
 
-    # FOR YOU - DYNAMIC PREDICTIONS
+    # ANALYST NOTES & STRATEGIC OUTLOOK
+    st.markdown(f"""<div class='analyst-card'><b>Strategic Forecast:</b> Predicted inflation of <b>{t_row[m['cpi']]:.1f}%</b> implies the Taylor-optimal rate should settle at <b>{t_row['Taylor']:.2f}%</b> by the end of the horizon.</div>""", unsafe_allow_html=True)
+
     st.markdown("<div class='section-header'><i class='fas fa-user-tie'></i> III. Strategic Outlook</div>", unsafe_allow_html=True)
     st.markdown(f"""<div class='for-you-card'><b>Forward-Looking Guidance:</b><br>
-    • <b>Mortgage Strategy:</b> With a projected terminal rate of {terminal_row['Taylor']:.2f}%, {'fixing rates now' if terminal_row['Taylor'] > hist_last[m['p']] else 'waiting for lower floating rates'} is advised.<br>
-    • <b>Capital Preservation:</b> Inflation is expected to trend toward {terminal_row[m['cpi']]:.1f}%. Current savings yields are {'insufficient' if terminal_row['Taylor'] < terminal_row[m['cpi']] else 'protective'} against price increases.<br>
-    • <b>Budgetary Risk:</b> {'High' if energy_shock > 30 else 'Moderate'} energy shock levels suggest a {energy_shock * 0.1:.1f}% hit to disposable income by {future_dates[-1].strftime('%b %Y')}.</div>""", unsafe_allow_html=True)
+    • <b>Mortgage Strategy:</b> With a projected terminal rate of {t_row['Taylor']:.2f}%, {'fixing rates now' if t_row['Taylor'] > h_last[m['p']] else 'waiting for lower floating rates'} is advised.<br>
+    • <b>Capital Preservation:</b> Inflation is expected to trend toward {t_row[m['cpi']]:.1f}%. Savings yields are {'insufficient' if t_row['Taylor'] < t_row[m['cpi']] else 'protective'}.</div>""", unsafe_allow_html=True)
 
-    # STATS & METHODOLOGY
-    st.divider()
-    colA, colB = st.columns([1, 1.2])
-    with colA:
-        st.markdown("<div class='section-header'><i class='fas fa-table'></i> IV. Model Outputs</div>", unsafe_allow_html=True)
-        if forecast_len > 0:
-            st.dataframe(df_f[['Date', m['cpi'], m['gdp'], 'Taylor']].rename(columns={'Taylor': 'Target Rate'}).style.format(precision=2), use_container_width=True)
-        else:
-            corr = df_h[[m['p'], m['cpi'], m['gdp'], m['fx']]].corr()
-            st.dataframe(corr.style.background_gradient(cmap='PuBu').format("{:.2f}"), use_container_width=True)
-
-    with colB:
-        st.markdown("<div class='section-header'><i class='fas fa-book'></i> V. Predictive Methodology</div>", unsafe_allow_html=True)
-        st.markdown(f"""<div class='method-card'>
-            <b>1. Forecasting Engine:</b> We employ <i>Holt-Winters Exponential Smoothing</i> (Additive Trend) to project CPI and GDP into 2025/26.
-            This captures the momentum of the 2012-2024 dataset.<br><br>
-            <b>2. Taylor Rule Projection:</b> The future 'Optimal Rate' (dashed gold line) is derived by feeding forecasted macro data into the policy reaction function: $i = r^* + \pi + 0.5(\pi - \pi^*) + 0.5(y - y^*)$.<br><br>
-            <b>3. Scenario Scaling:</b> User-defined shocks (Energy/Scenario) are applied to the entire timeline, allowing for dynamic stress-testing of future policy paths.
-        </div>""", unsafe_allow_html=True)
 else:
     st.error("Missing Data: Ensure .xlsx files are present in the directory.")
