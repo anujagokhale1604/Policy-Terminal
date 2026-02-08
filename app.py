@@ -17,6 +17,7 @@ st.markdown("""
     .stPlotlyChart { margin-top: -25px; } 
     section[data-testid="stSidebar"] { background-color: #E5E1D8 !important; border-right: 1px solid #A39B8F; }
     .analyst-card { padding: 15px; border: 1px solid #A39B8F; background-color: #FFFFFF; margin-bottom: 20px; border-left: 5px solid #002366; font-size: 0.95rem; }
+    .for-you-card { padding: 20px; background-color: #FDFCFB; color: #1A1A1A; margin-bottom: 25px; border: 1px solid #A39B8F; border-left: 10px solid #002366; }
     .main-title { font-size: 32px; font-weight: bold; color: #002366; border-bottom: 3px solid #C5A059; padding-bottom: 5px; margin-bottom: 20px; }
     .section-header { color: #7A6D5D; font-weight: bold; font-size: 1.2rem; margin-top: 20px; margin-bottom: 5px; text-transform: uppercase; }
     </style>
@@ -48,26 +49,18 @@ def load_data():
         return df.sort_values('Date').ffill().bfill()
     except: return None
 
-# --- 3. VAR ECONOMETRIC ENGINE ---
-def run_var_forecast(df, cols, steps):
-    """Endogenous Multivariate Forecasting."""
-    data = df[cols].dropna()
-    model = VAR(data)
-    results = model.fit(maxlags=12) # 12 months lag for macro cycles
-    forecast = results.forecast(data.values[-results.k_ar:], steps)
-    return forecast, results
-
-# --- 4. SIDEBAR ---
+# --- 3. SIDEBAR ---
 with st.sidebar:
     st.markdown("<h2>NAVIGATE</h2>", unsafe_allow_html=True)
     market = st.selectbox("SELECT MARKET", ["India", "UK", "Singapore"])
     forecast_len = st.slider("Forecast Horizon (Months)", 0, 24, 12)
-    show_intervals = st.toggle("Show Confidence Intervals", value=True)
     st.divider()
     scenario = st.selectbox("SCENARIO ENGINE", ["Standard", "Stagflation 🌪️", "Depression 📉"])
     severity = st.slider("SEVERITY (%)", 0, 100, 50)
+    st.divider()
+    show_diagnostics = st.toggle("Show VAR Model Health", value=False)
 
-# --- 5. ANALYTICS ---
+# --- 4. ANALYTICS (VAR ENGINE) ---
 df_raw = load_data()
 if df_raw is not None:
     m_map = {
@@ -78,51 +71,57 @@ if df_raw is not None:
     m = m_map[market]
     cols = [m['p'], m['cpi'], m['gdp']]
     
-    # Run VAR Model
+    # Run VAR
     last_date = df_raw['Date'].max()
-    forecast_values, var_results = run_var_forecast(df_raw, cols, forecast_len)
+    model = VAR(df_raw[cols].dropna())
+    results = model.fit(maxlags=12)
+    forecast = results.forecast(df_raw[cols].values[-results.k_ar:], forecast_len)
     
-    # Construct Forecast DataFrame
+    # Construct DF
     future_dates = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=forecast_len, freq='MS')
-    df_f = pd.DataFrame(forecast_values, columns=cols)
+    df_f = pd.DataFrame(forecast, columns=cols)
     df_f['Date'] = future_dates
     df_f['Is_Forecast'] = True
+    df_f[m['fx']] = df_raw[m['fx']].iloc[-1] # Simple placeholder for FX
     
-    df_h = df_raw.copy()
-    df_h['Is_Forecast'] = False
+    df_h = df_raw.copy(); df_h['Is_Forecast'] = False
     df = pd.concat([df_h, df_f]).reset_index(drop=True)
 
-    # UI Rendering
-    st.markdown(f"<div class='main-title'>{market.upper()} VAR RESEARCH TERMINAL</div>", unsafe_allow_html=True)
+    # --- UI RENDERING ---
+    st.markdown(f"<div class='main-title'>{market.upper()} RESEARCH TERMINAL</div>", unsafe_allow_html=True)
     
-    # METRICS
     t_row = df.iloc[-1]
-    c1, c2, c3 = st.columns(3)
-    c1.metric("VAR TERMINAL RATE", f"{t_row[m['p']]:.2f}%")
+    h_row = df_h.iloc[-1]
+    
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("VAR TARGET RATE", f"{t_row[m['p']]:.2f}%", f"{t_row[m['p']] - h_row[m['p']]:.2f}%")
     c2.metric("PROJ. CPI", f"{t_row[m['cpi']]:.2f}%")
     c3.metric("PROJ. GDP", f"{t_row[m['gdp']]:.1f}%")
+    c4.metric(f"FX ({m['sym']})", f"{t_row[m['fx']]:.2f}")
 
     # CHART
+    st.markdown("<div class='section-header'><i class='fas fa-chart-line'></i> I. Endogenous Policy & Inflation Projections</div>", unsafe_allow_html=True)
     fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Scatter(x=df['Date'], y=df[m['p']], name="Policy Rate (VAR)", line=dict(color='#002366', width=3)))
-    fig.add_trace(go.Scatter(x=df['Date'], y=df[m['cpi']], name="CPI Projection", line=dict(color='#A52A2A', dash='dot')))
-    
+    fig.add_trace(go.Scatter(x=df['Date'], y=df[m['p']], name="Policy Rate (VAR Path)", line=dict(color='#002366', width=3)))
+    fig.add_trace(go.Scatter(x=df['Date'], y=df[m['cpi']], name="CPI (YoY)", line=dict(color='#A52A2A', dash='dot')), secondary_y=True)
     if forecast_len > 0:
-        fig.add_vrect(x0=last_date, x1=df['Date'].max(), fillcolor="gray", opacity=0.1, annotation_text="Forecast Window")
-
-    fig.update_layout(height=450, template="plotly_white")
+        fig.add_vrect(x0=last_date, x1=df['Date'].max(), fillcolor="gray", opacity=0.1)
+    fig.update_layout(height=400, template="plotly_white", margin=dict(l=20, r=20, t=10, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
-    # GRADUATE LEVEL EQUATIONS
-    st.markdown("<div class='section-header'>Econometric Specification</div>", unsafe_allow_html=True)
-    st.latex(r'''
-        \mathbf{Y}_t = \mathbf{c} + \sum_{i=1}^{p} \mathbf{\Phi}_i \mathbf{Y}_{t-i} + \boldsymbol{\epsilon}_t
-    ''')
-    st.info("The Vector Autoregression (VAR) model above captures the linear interdependencies among Policy Rates, Inflation, and GDP growth. Unlike univariate models, it accounts for the fact that past policy shocks influence future output gaps.")
+    # ANALYSIS NOTES
+    st.markdown(f"""<div class='analyst-card'><b>Econometric Insight:</b> The Vector Autoregression (VAR) model suggests a <b>{'tightening' if t_row[m['p']] > h_row[m['p']] else 'easing'}</b> cycle. 
+    The projected interaction between inflation and growth implies a terminal rate equilibrium of <b>{t_row[m['p']]:.2f}%</b> by {future_dates[-1].year if forecast_len > 0 else 'year-end'}.</div>""", unsafe_allow_html=True)
 
-    # MODEL HEALTH
-    with st.expander("View VAR Model Diagnostics (p-values & Coefficients)"):
-        st.text(var_results.summary())
+    # RECOMMENDATIONS
+    st.markdown("<div class='section-header'><i class='fas fa-user-tie'></i> II. Strategic Recommendations</div>", unsafe_allow_html=True)
+    st.markdown(f"""<div class='for-you-card'><b>Forward Guidance:</b><br>
+    • <b>Asset Allocation:</b> Projections show GDP at {t_row[m['gdp']]:.1f}%. If this signifies a slowdown, pivot toward defensive equities.<br>
+    • <b>Debt Management:</b> The VAR path suggests rates will be {abs(t_row[m['p']] - h_row[m['p']]):.2f}% {'higher' if t_row[m['p']] > h_row[m['p']] else 'lower'} in {forecast_len} months. Adjust variable-rate exposure accordingly.</div>""", unsafe_allow_html=True)
 
-else:
-    st.error("Data missing.")
+    # LATEX
+    st.markdown("<div class='section-header'>VAR Specification</div>", unsafe_allow_html=True)
+    st.latex(r'''y_t = A_1 y_{t-1} + \dots + A_p y_{t-p} + u_t''')
+    
+    if show_diagnostics:
+        st.text(results.summary())
