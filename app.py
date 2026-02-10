@@ -7,94 +7,101 @@ from datetime import datetime
 st.set_page_config(page_title="Institutional Macro Terminal", layout="wide")
 
 def load_data():
-    # Helper to load files (supports .xlsx as per your requirement)
-    def get_df(filename, sheet=0, skip=0):
-        if os.path.exists(filename):
-            try:
-                # Prioritize Excel as requested
-                if filename.lower().endswith('.csv'):
-                    df = pd.read_csv(filename, skiprows=skip)
-                else:
-                    df = pd.read_excel(filename, sheet_name=sheet, skiprows=skip)
-                
-                # Standardize: Trim whitespace and handle case
-                df.columns = [str(c).strip() for c in df.columns]
-                return df
-            except Exception as e:
-                st.error(f"Error loading {filename}: {e}")
-        return pd.DataFrame()
+    def get_df_safe(filename, expected_col):
+        """Tries to find the sheet containing the actual data."""
+        if not os.path.exists(filename):
+            return pd.DataFrame()
+        
+        try:
+            # Load the Excel file and check all sheet names
+            xl = pd.ExcelFile(filename)
+            target_sheet = xl.sheet_names[0]
+            
+            # If the first sheet is 'README', try the second one
+            if 'README' in target_sheet.upper() and len(xl.sheet_names) > 1:
+                target_sheet = xl.sheet_names[1]
+            # Or if a sheet name matches the frequency (Monthly/Daily)
+            for s in xl.sheet_names:
+                if any(x in s.lower() for x in ['monthly', 'daily', 'observation']):
+                    target_sheet = s
+                    break
 
-    # 1. Setup Master Timeline
-    macro_df = get_df("EM_Macro_Data_India_SG_UK.xlsx", sheet='Macro data')
+            df = pd.read_excel(filename, sheet_name=target_sheet)
+            df.columns = [str(c).strip() for c in df.columns]
+            
+            # Check if expected column is there; if not, the first numeric-looking column
+            if expected_col not in df.columns:
+                # Fallback: find first col that isn't the date
+                potential_cols = [c for c in df.columns if c.lower() not in ['date', 'observation_date']]
+                if potential_cols:
+                    df = df.rename(columns={potential_cols[0]: expected_col})
+            
+            return df
+        except Exception as e:
+            return pd.DataFrame()
+
+    # 1. Setup Master Timeline (India/UK/SG file)
+    # Note: Using sheet='Macro data' specifically as you provided
+    macro_df = pd.read_excel("EM_Macro_Data_India_SG_UK.xlsx", sheet_name='Macro data')
+    macro_df.columns = [str(c).strip() for c in macro_df.columns]
     
-    if macro_df.empty:
-        # Fallback if the main file isn't found
-        dates = pd.date_range(start='2012-01-01', end=datetime.now(), freq='MS')
-        master = pd.DataFrame({'Date': dates})
-    else:
-        d_col = 'Date' if 'Date' in macro_df.columns else macro_df.columns[0]
-        macro_df[d_col] = pd.to_datetime(macro_df[d_col], errors='coerce')
-        master = macro_df[[d_col]].dropna().copy().rename(columns={d_col: 'Date'})
-        master['Date'] = master['Date'].dt.to_period('M').dt.to_timestamp()
-
-    # INITIALIZE: Ensure these always exist to prevent KeyErrors
-    for col in ['T10Y2Y', 'PALLFNFINDEXM', 'DEXINUS', 'CCI']:
-        if col not in master.columns:
-            master[col] = 0.0
+    d_col = 'Date' if 'Date' in macro_df.columns else macro_df.columns[0]
+    macro_df[d_col] = pd.to_datetime(macro_df[d_col], errors='coerce')
+    master = macro_df[[d_col]].dropna().copy().rename(columns={d_col: 'Date'})
+    master['Date'] = master['Date'].dt.to_period('M').dt.to_timestamp()
 
     # 2. Indicators Mapping
+    # Format: (filename, value_column_name)
     indicators = [
-        ("T10Y2Y.xlsx", "observation_date", "T10Y2Y"),
-        ("PALLFNFINDEXM.xlsx", "observation_date", "PALLFNFINDEXM"),
-        ("DEXINUS.xlsx", "observation_date", "DEXINUS")
+        ("T10Y2Y.xlsx", "T10Y2Y"),
+        ("PALLFNFINDEXM.xlsx", "PALLFNFINDEXM"),
+        ("DEXINUS.xlsx", "DEXINUS")
     ]
 
-    for file, d_col, v_col in indicators:
-        df_ind = get_df(file)
+    for file, v_col in indicators:
+        df_ind = get_df_safe(file, v_col)
         if not df_ind.empty:
-            actual_d_col = d_col if d_col in df_ind.columns else df_ind.columns[0]
-            df_ind[actual_d_col] = pd.to_datetime(df_ind[actual_d_col], errors='coerce')
-            df_ind = df_ind.dropna(subset=[actual_d_col])
+            # Find date column automatically
+            d_col_ind = next((c for c in df_ind.columns if 'date' in c.lower()), df_ind.columns[0])
             
-            # Aggregate to monthly
-            df_ind = df_ind.set_index(actual_d_col).resample('MS').last().reset_index()
-            df_ind = df_ind.rename(columns={actual_d_col: 'Date'})
+            df_ind[d_col_ind] = pd.to_datetime(df_ind[d_col_ind], errors='coerce')
+            df_ind = df_ind.dropna(subset=[d_col_ind])
+            
+            # Aggregate to Monthly Start
+            df_ind = df_ind.set_index(d_col_ind).resample('MS').last().reset_index()
+            df_ind = df_ind.rename(columns={d_col_ind: 'Date'})
             
             if v_col in df_ind.columns:
-                # Merge and update our master column
-                master = master.merge(df_ind[['Date', v_col]], on='Date', how='left', suffixes=('', '_new'))
-                if f'{v_col}_new' in master.columns:
-                    master[v_col] = master[f'{v_col}_new'].combine_first(master[v_col])
-                    master = master.drop(columns=[f'{v_col}_new'])
+                master = master.merge(df_ind[['Date', v_col]], on='Date', how='left')
 
-    # 3. Handle CCI (Consumer Confidence)
+    # 3. Handle CCI (CSV format as detected earlier)
     cci_file = "export-2026-02-10T06_50_22.597Z.csv"
     if os.path.exists(cci_file):
         cci_df = pd.read_csv(cci_file, skiprows=3, names=['Date', 'CCI'])
         cci_df['Date'] = pd.to_datetime(cci_df['Date'], errors='coerce')
         cci_df = cci_df.dropna().set_index('Date').resample('MS').last().reset_index()
-        master = master.merge(cci_df, on='Date', how='left', suffixes=('', '_new'))
-        if 'CCI_new' in master.columns:
-            master['CCI'] = master['CCI_new'].combine_first(master['CCI'])
-            master = master.drop(columns=['CCI_new'])
+        master = master.merge(cci_df, on='Date', how='left')
 
+    # Clean up and forward fill
     return master.ffill().fillna(0.0)
 
-# --- APP UI ---
+# --- UI ---
 df = load_data()
-
 st.title("🏛️ INSTITUTIONAL MACRO TERMINAL")
 
 if not df.empty:
     latest = df.iloc[-1]
     
-    # 1. Top Row Metrics
     c1, c2, c3, c4 = st.columns(4)
     spread = latest.get('T10Y2Y', 0.0)
-    # Yield spread is usually 0.0 if data failed to load; check for valid spread
-    risk = 65.0 if spread <= 0 and spread != 0 else 22.5
-    if spread == 0: risk = 0.0 # No data fallback
     
+    # Recession Risk: If spread is negative (inverted), risk is high
+    # Check if we actually have data (not 0.0)
+    if spread != 0.0:
+        risk = 65.0 if spread < 0 else 15.0
+    else:
+        risk = 0.0
+
     c1.metric("RECESSION RISK", f"{risk}%")
     c2.metric("YIELD SPREAD (10Y-2Y)", f"{spread:.2f}")
     c3.metric("CONS. CONFIDENCE", f"{latest.get('CCI', 0.0):.1f}")
@@ -102,19 +109,11 @@ if not df.empty:
 
     st.divider()
     
-    # 2. Market Trends Chart (REFIXED FOR KEYERROR)
     st.subheader("Market Trends")
-    # Only select columns that actually exist in the dataframe and have non-zero data
-    plot_cols = [c for c in ['T10Y2Y', 'CCI', 'PALLFNFINDEXM'] 
-                 if c in df.columns and (df[c] != 0).any()]
-    
+    # Plot only columns that have data
+    plot_cols = [c for c in ['T10Y2Y', 'CCI', 'PALLFNFINDEXM'] if c in df.columns and (df[c] != 0).any()]
     if plot_cols:
         st.line_chart(df.set_index('Date')[plot_cols])
-    else:
-        st.info("Trend data currently unavailable. Check file paths.")
     
-    # 3. Currency
     st.subheader("Latest Spot Rates")
     st.write(f"**INR/USD:** {latest.get('DEXINUS', 0.0):.2f}")
-else:
-    st.error("Terminal could not initialize. Ensure data files are present.")
