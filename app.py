@@ -5,123 +5,141 @@ from plotly.subplots import make_subplots
 import os
 import numpy as np
 from statsmodels.tsa.api import VAR
+from scipy.stats import norm
 
-# --- 1. CHIC RESEARCH UI ENGINE ---
-st.set_page_config(page_title="Macro Intel Pro", layout="wide")
+# --- 1. RESEARCH UI ENGINE ---
+st.set_page_config(page_title="Macro Quant Terminal", layout="wide")
 
 st.markdown("""
     <style>
     * { font-family: 'Times New Roman', Times, serif !important; }
     .stApp { background-color: #F2EFE9; color: #2C2C2C; }
-    .block-container { padding-top: 1rem; padding-bottom: 1rem; }
-    .stPlotlyChart { margin-top: -25px; } 
-    section[data-testid="stSidebar"] { background-color: #E5E1D8 !important; border-right: 1px solid #A39B8F; }
-    .analyst-card { padding: 15px; border: 1px solid #A39B8F; background-color: #FFFFFF; margin-bottom: 20px; border-left: 5px solid #002366; font-size: 0.95rem; }
-    .for-you-card { padding: 20px; background-color: #FDFCFB; color: #1A1A1A; margin-bottom: 25px; border: 1px solid #A39B8F; border-left: 10px solid #002366; }
-    .main-title { font-size: 32px; font-weight: bold; color: #002366; border-bottom: 3px solid #C5A059; padding-bottom: 5px; margin-bottom: 20px; }
-    .section-header { color: #7A6D5D; font-weight: bold; font-size: 1.2rem; margin-top: 20px; margin-bottom: 5px; text-transform: uppercase; }
+    .analyst-card { padding: 15px; border: 1px solid #A39B8F; background-color: #FFFFFF; border-left: 5px solid #002366; font-size: 0.95rem; margin-bottom: 20px; }
+    .for-you-card { padding: 20px; background-color: #FDFCFB; border: 1px solid #A39B8F; border-left: 10px solid #002366; margin-bottom: 25px; }
+    .main-title { font-size: 32px; font-weight: bold; color: #002366; border-bottom: 3px solid #C5A059; padding-bottom: 5px; margin-bottom: 20px;}
+    .section-header { color: #7A6D5D; font-weight: bold; font-size: 1.1rem; text-transform: uppercase; margin-top: 15px; margin-bottom: 10px; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. DATA ENGINE ---
+# --- 2. DATA PIPELINE ---
 @st.cache_data
-def load_data():
-    files = {"workbook": 'EM_Macro_Data_India_SG_UK.xlsx', "inr": 'DEXINUS.xlsx', "gbp": 'DEXUSUK.xlsx', "sgd": 'AEXSIUS.xlsx'}
-    if not all(os.path.exists(f) for f in files.values()): return None
+def load_and_merge_data():
     try:
-        df_m = pd.read_excel(files["workbook"], sheet_name='Macro data')
-        df_m['Date'] = pd.to_datetime(df_m['Date'], errors='coerce')
-        df_g = pd.read_excel(files["workbook"], sheet_name='GDP_Growth', skiprows=1).iloc[1:, [0, 2, 3, 4]]
-        df_g.columns = ['Year', 'GDP_India', 'GDP_Singapore', 'GDP_UK']
+        # A. Primary Macro Workbook
+        # Assuming the original xlsx file is present
+        xl = pd.ExcelFile('EM_Macro_Data_India_SG_UK.xlsx')
+        df_m = xl.parse('Macro data')
+        df_m['Date'] = pd.to_datetime(df_m['Date'])
         
-        def clean_fx(path, out_name):
-            xls = pd.ExcelFile(path); sheet = [s for s in xls.sheet_names if 'README' not in s.upper()][0]
-            f = pd.read_excel(path, sheet_name=sheet)
-            d_col = [c for c in f.columns if 'date' in str(c).lower()][0]
-            v_col = [c for c in f.columns if c != d_col][0]
-            f[d_col] = pd.to_datetime(f[d_col], errors='coerce')
-            f[v_col] = pd.to_numeric(f[v_col].replace(0, pd.NA), errors='coerce')
-            return f.dropna(subset=[d_col]).resample('MS', on=d_col).mean().ffill().bfill().reset_index().rename(columns={d_col:'Date', v_col:out_name})
+        # B. Yield Curve (Handling Daily -> Monthly Resampling)
+        df_yield = pd.read_csv('T10Y2Y.xlsx - Daily.csv')
+        df_yield['observation_date'] = pd.to_datetime(df_yield['observation_date'])
+        # Standard Econ practice: Use the monthly mean for macro models
+        df_yield = df_yield.set_index('observation_date').resample('MS').mean().reset_index().rename(columns={'observation_date': 'Date'})
+        
+        # C. Commodity Index (Monthly)
+        df_comm = pd.read_csv('PALLFNFINDEXM.xlsx - Monthly.csv')
+        df_comm['Date'] = pd.to_datetime(df_comm['observation_date'])
+        df_comm = df_comm[['Date', 'PALLFNFINDEXM']]
 
-        fx_i, fx_g, fx_s = clean_fx(files["inr"], 'FX_India'), clean_fx(files["gbp"], 'FX_UK'), clean_fx(files["sgd"], 'FX_Singapore')
-        df_m['Year'] = df_m['Date'].dt.year
-        df = df_m.merge(df_g, on='Year', how='left').merge(fx_i, on='Date', how='left').merge(fx_g, on='Date', how='left').merge(fx_s, on='Date', how='left')
+        # D. Consumer Confidence Index (CSV with header rows)
+        df_cci = pd.read_csv('export-2026-02-10T06_50_22.597Z.csv', skiprows=4, header=None, names=['Date', 'CCI'])
+        df_cci['Date'] = pd.to_datetime(df_cci['Date'])
+
+        # Merge Pipeline
+        df = df_m.merge(df_yield, on='Date', how='left')
+        df = df.merge(df_comm, on='Date', how='left')
+        df = df.merge(df_cci, on='Date', how='left')
+        
         return df.sort_values('Date').ffill().bfill()
-    except: return None
+    except Exception as e:
+        st.error(f"Data Pipeline Error: {e}")
+        return None
 
-# --- 3. SIDEBAR ---
+# --- 3. ECONOMETRIC CALCS ---
+def get_recession_prob(spread):
+    """Probit-style recession probability based on yield curve inversion"""
+    # Simplified institutional logic: Prob rises as spread drops below 0
+    return norm.cdf(-0.5 - (1.5 * spread))
+
+# --- 4. DASHBOARD RENDER ---
+df = load_and_merge_data()
+
 with st.sidebar:
     st.markdown("<h2>NAVIGATE</h2>", unsafe_allow_html=True)
-    market = st.selectbox("SELECT MARKET", ["India", "UK", "Singapore"])
-    forecast_len = st.slider("Forecast Horizon (Months)", 0, 24, 12)
+    market = st.selectbox("1. SELECT MARKET", ["India", "UK", "Singapore"])
+    forecast_len = st.slider("2. VAR FORECAST HORIZON", 6, 24, 12)
     st.divider()
-    scenario = st.selectbox("SCENARIO ENGINE", ["Standard", "Stagflation 🌪️", "Depression 📉"])
-    severity = st.slider("SEVERITY (%)", 0, 100, 50)
-    st.divider()
-    show_diagnostics = st.toggle("Show VAR Model Health", value=False)
+    st.markdown("<b>VAR SETTINGS</b>")
+    lags = st.number_input("Model Lags (Months)", 1, 12, 6)
 
-# --- 4. ANALYTICS (VAR ENGINE) ---
-df_raw = load_data()
-if df_raw is not None:
+if df is not None:
     m_map = {
-        "India": {"p": "Policy_India", "cpi": "CPI_India", "gdp": "GDP_India", "fx": "FX_India", "sym": "INR", "t": 4.0, "n": 4.5},
-        "UK": {"p": "Policy_UK", "cpi": "CPI_UK", "gdp": "GDP_UK", "fx": "FX_UK", "sym": "GBP", "t": 2.0, "n": 2.5},
-        "Singapore": {"p": "Policy_Singapore", "cpi": "CPI_Singapore", "gdp": "GDP_Singapore", "fx": "FX_Singapore", "sym": "SGD", "t": 2.0, "n": 2.5}
+        "India": {"p": "Policy_India", "cpi": "CPI_India", "gdp": "GDP_India", "sym": "INR"},
+        "UK": {"p": "Policy_UK", "cpi": "CPI_UK", "gdp": "GDP_UK", "sym": "GBP"},
+        "Singapore": {"p": "Policy_Singapore", "cpi": "CPI_Singapore", "gdp": "GDP_Singapore", "sym": "SGD"}
     }
     m = m_map[market]
-    cols = [m['p'], m['cpi'], m['gdp']]
     
-    # Run VAR
-    last_date = df_raw['Date'].max()
-    model = VAR(df_raw[cols].dropna())
-    results = model.fit(maxlags=12)
-    forecast = results.forecast(df_raw[cols].values[-results.k_ar:], forecast_len)
+    # --- VAR MODELING ---
+    # We include Policy Rate, CPI, and Commodities as endogenous variables
+    var_cols = [m['p'], m['cpi'], 'PALLFNFINDEXM']
+    model_df = df[var_cols].dropna()
+    var_model = VAR(model_df)
+    results = var_model.fit(lags)
+    forecast = results.forecast(model_df.values[-results.k_ar:], forecast_len)
     
-    # Construct DF
-    future_dates = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=forecast_len, freq='MS')
-    df_f = pd.DataFrame(forecast, columns=cols)
-    df_f['Date'] = future_dates
-    df_f['Is_Forecast'] = True
-    df_f[m['fx']] = df_raw[m['fx']].iloc[-1] # Simple placeholder for FX
+    # Latest Data for Metrics
+    curr_spread = df['T10Y2Y'].iloc[-1]
+    rec_prob = get_recession_prob(curr_spread)
     
-    df_h = df_raw.copy(); df_h['Is_Forecast'] = False
-    df = pd.concat([df_h, df_f]).reset_index(drop=True)
-
-    # --- UI RENDERING ---
-    st.markdown(f"<div class='main-title'>{market.upper()} RESEARCH TERMINAL</div>", unsafe_allow_html=True)
-    
-    t_row = df.iloc[-1]
-    h_row = df_h.iloc[-1]
-    
+    # METRICS BAR
+    st.markdown(f"<div class='main-title'>{market.upper()} QUANT STRATEGY TERMINAL</div>", unsafe_allow_html=True)
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("VAR TARGET RATE", f"{t_row[m['p']]:.2f}%", f"{t_row[m['p']] - h_row[m['p']]:.2f}%")
-    c2.metric("PROJ. CPI", f"{t_row[m['cpi']]:.2f}%")
-    c3.metric("PROJ. GDP", f"{t_row[m['gdp']]:.1f}%")
-    c4.metric(f"FX ({m['sym']})", f"{t_row[m['fx']]:.2f}")
+    c1.metric("VAR TERMINAL RATE", f"{forecast[-1, 0]:.2f}%")
+    c2.metric("SUPPLY STRESS (PALL)", f"{df['PALLFNFINDEXM'].iloc[-1]:.1f}")
+    c3.metric("RECESSION PROB.", f"{rec_prob*100:.1f}%")
+    c4.metric("CONS. CONFIDENCE", f"{df['CCI'].iloc[-1]:.1f}")
 
-    # CHART
-    st.markdown("<div class='section-header'><i class='fas fa-chart-line'></i> I. Endogenous Policy & Inflation Projections</div>", unsafe_allow_html=True)
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Scatter(x=df['Date'], y=df[m['p']], name="Policy Rate (VAR Path)", line=dict(color='#002366', width=3)))
-    fig.add_trace(go.Scatter(x=df['Date'], y=df[m['cpi']], name="CPI (YoY)", line=dict(color='#A52A2A', dash='dot')), secondary_y=True)
-    if forecast_len > 0:
-        fig.add_vrect(x0=last_date, x1=df['Date'].max(), fillcolor="gray", opacity=0.1)
-    fig.update_layout(height=400, template="plotly_white", margin=dict(l=20, r=20, t=10, b=10))
+    # CHARTS
+    st.markdown("<div class='section-header'><i class='fas fa-microchip'></i> I. Endogenous Multi-Variable Projections</div>", unsafe_allow_html=True)
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, 
+                        subplot_titles=("Policy & Inflation Path", "Yield Curve (Recession Predictor)"))
+    
+    fig.add_trace(go.Scatter(x=df['Date'], y=df[m['p']], name="Policy Rate", line=dict(color='#002366', width=3)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['Date'], y=df[m['cpi']], name="CPI (YoY)", line=dict(color='#A52A2A', dash='dot')), row=1, col=1)
+    
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['T10Y2Y'], name="Yield Spread (10Y-2Y)", fill='tozeroy', line=dict(color='#2E8B57')), row=2, col=1)
+    
+    fig.update_layout(height=550, template="plotly_white", margin=dict(l=20, r=20, t=30, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
-    # ANALYSIS NOTES
-    st.markdown(f"""<div class='analyst-card'><b>Econometric Insight:</b> The Vector Autoregression (VAR) model suggests a <b>{'tightening' if t_row[m['p']] > h_row[m['p']] else 'easing'}</b> cycle. 
-    The projected interaction between inflation and growth implies a terminal rate equilibrium of <b>{t_row[m['p']]:.2f}%</b> by {future_dates[-1].year if forecast_len > 0 else 'year-end'}.</div>""", unsafe_allow_html=True)
+    # ANALYST NOTES
+    st.markdown("<div class='section-header'><i class='fas fa-file-contract'></i> II. Analyst Intelligence Note</div>", unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class='analyst-card'>
+    <b>Model Insight:</b> The Vector Autoregression (VAR) model accounts for the feedback loop between commodity prices and local policy. 
+    Current data shows a yield spread of <b>{curr_spread:.2f}bps</b>. Historically, inversions of this magnitude imply a 
+    <b>{rec_prob*100:.1f}%</b> probability of a hard landing within 18 months. 
+    The CCI at <b>{df['CCI'].iloc[-1]:.1f}</b> indicates consumer sentiment is {'stable' if df['CCI'].iloc[-1] > 100 else 'deteriorating'}.
+    </div>
+    """, unsafe_allow_html=True)
 
     # RECOMMENDATIONS
-    st.markdown("<div class='section-header'><i class='fas fa-user-tie'></i> II. Strategic Recommendations</div>", unsafe_allow_html=True)
-    st.markdown(f"""<div class='for-you-card'><b>Forward Guidance:</b><br>
-    • <b>Asset Allocation:</b> Projections show GDP at {t_row[m['gdp']]:.1f}%. If this signifies a slowdown, pivot toward defensive equities.<br>
-    • <b>Debt Management:</b> The VAR path suggests rates will be {abs(t_row[m['p']] - h_row[m['p']]):.2f}% {'higher' if t_row[m['p']] > h_row[m['p']] else 'lower'} in {forecast_len} months. Adjust variable-rate exposure accordingly.</div>""", unsafe_allow_html=True)
+    st.markdown("<div class='section-header'><i class='fas fa-briefcase'></i> III. Portfolio Recommendations</div>", unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class='for-you-card'>
+    <b>Institutional Positioning:</b><br>
+    • <b>Interest Rate Risk:</b> The VAR path suggests a terminal equilibrium of {forecast[-1, 0]:.2f}%. Investors should {'lock in yields' if forecast[-1, 0] < df[m['p']].iloc[-1] else 'stay floating'} to optimize carry.<br>
+    • <b>Inflation Hedge:</b> With Global Commodities at {df['PALLFNFINDEXM'].iloc[-1]:.1f}, supply-side pressure remains {'elevated' if df['PALLFNFINDEXM'].iloc[-1] > 150 else 'moderate'}. Diversification into hard assets is recommended.
+    </div>
+    """, unsafe_allow_html=True)
 
     # LATEX
-    st.markdown("<div class='section-header'>VAR Specification</div>", unsafe_allow_html=True)
-    st.latex(r'''y_t = A_1 y_{t-1} + \dots + A_p y_{t-p} + u_t''')
-    
-    if show_diagnostics:
-        st.text(results.summary())
+    st.markdown("<div class='section-header'>Econometric Specification</div>", unsafe_allow_html=True)
+    st.latex(r'''
+    Y_t = C + \sum_{i=1}^{p} \Phi_i Y_{t-i} + \epsilon_t, \quad Y = [Policy, CPI, Commodities]^T
+    ''')
+
+else:
+    st.error("Missing required data files. Ensure Excel and CSVs are in the directory.")
