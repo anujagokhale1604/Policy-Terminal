@@ -1,85 +1,100 @@
-import pandas as pd
 import streamlit as st
-from datetime import datetime
+import pandas as pd
 import os
+from datetime import datetime
+
+# --- CONFIGURATION ---
+st.set_page_config(page_title="Institutional Macro Terminal", layout="wide")
 
 def load_data():
-    # Helper to load either XLSX or CSV based on availability
-    def get_df(filename, **kwargs):
+    def get_df(filename, sheet=0, skip=0):
         if os.path.exists(filename):
+            # As per instruction: All files are xlsx
             if filename.endswith('.csv'):
-                return pd.read_csv(filename, **kwargs)
+                return pd.read_csv(filename, skiprows=skip)
             else:
-                return pd.read_excel(filename, **kwargs)
+                return pd.read_excel(filename, sheet_name=sheet, skiprows=skip)
         return pd.DataFrame()
 
-    # 1. Load Macro Data (Primary timeline)
-    # Note: Using sheet_name='Macro data' as verified in the file
-    macro_df = get_df("EM_Macro_Data_India_SG_UK.xlsx", sheet_name='Macro data')
-    if not macro_df.empty:
-        macro_df['Date'] = pd.to_datetime(macro_df['Date'], errors='coerce')
-        macro_df = macro_df.dropna(subset=['Date'])
-    else:
-        # Create dummy range if file missing
-        macro_df = pd.DataFrame({'Date': pd.date_range(start='2012-01-01', end=datetime.now(), freq='MS')})
+    # 1. Setup Master Timeline (India/UK/SG file)
+    macro_df = get_df("EM_Macro_Data_India_SG_UK.xlsx", sheet='Macro data')
+    
+    if macro_df.empty:
+        st.error("Primary data file 'EM_Macro_Data_India_SG_UK.xlsx' not found.")
+        return pd.DataFrame()
 
-    # 2. Define Indicators to merge
-    # Format: (filename, date_column_name, value_column_name, skiprows)
+    # SAFETY: If 'Date' isn't found, try the first column
+    d_col_macro = 'Date' if 'Date' in macro_df.columns else macro_df.columns[0]
+    macro_df[d_col_macro] = pd.to_datetime(macro_df[d_col_macro], errors='coerce')
+    macro_df = macro_df.dropna(subset=[d_col_macro])
+
+    master = macro_df[[d_col_macro]].copy().rename(columns={d_col_macro: 'Date'})
+    master['Date'] = master['Date'].dt.to_period('M').dt.to_timestamp()
+
+    # 2. Indicators Mapping (Excel Files)
     indicators = [
-        ("T10Y2Y.xlsx", "observation_date", "T10Y2Y", 0),
-        ("PALLFNFINDEXM.xlsx", "observation_date", "PALLFNFINDEXM", 0),
-        ("DEXINUS.xlsx", "observation_date", "DEXINUS", 0),
-        # CCI file is CSV and requires skipping metadata lines
-        ("export-2026-02-10T06_50_22.597Z.csv", "Date", "CCI", 3) 
+        ("T10Y2Y.xlsx", "observation_date", "T10Y2Y"),
+        ("PALLFNFINDEXM.xlsx", "observation_date", "PALLFNFINDEXM"),
+        ("DEXINUS.xlsx", "observation_date", "DEXINUS")
     ]
 
-    master = macro_df[['Date']].copy()
-    master['Date'] = master['Date'].dt.to_period('M').dt.to_timestamp()
-    master = master.drop_duplicates('Date').sort_values('Date')
-
-    for file, d_col, v_col, skip in indicators:
-        df_ind = pd.DataFrame()
-        if "export" in file: # Special handling for the OECD CSV
-            df_ind = get_df(file, skiprows=skip, names=['Date', 'CCI'])
-            d_col, v_col = 'Date', 'CCI'
-        else:
-            df_ind = get_df(file)
-            
+    for file, d_col, v_col in indicators:
+        df_ind = get_df(file)
         if not df_ind.empty:
-            df_ind[d_col] = pd.to_datetime(df_ind[d_col], errors='coerce')
-            df_ind = df_ind.dropna(subset=[d_col])
-            # Resample to monthly to match master
-            df_ind = df_ind.set_index(d_col).resample('MS').last().reset_index()
-            df_ind = df_ind.rename(columns={d_col: 'Date'})
-            master = master.merge(df_ind[['Date', v_col]], on='Date', how='left')
+            df_ind.columns = [str(c).strip() for c in df_ind.columns]
+            # SAFETY CHECK: Prevent the KeyError
+            actual_d_col = d_col if d_col in df_ind.columns else df_ind.columns[0]
+            
+            df_ind[actual_d_col] = pd.to_datetime(df_ind[actual_d_col], errors='coerce')
+            df_ind = df_ind.dropna(subset=[actual_d_col])
+            
+            # Resample to monthly
+            df_ind = df_ind.set_index(actual_d_col).resample('MS').last().reset_index()
+            df_ind = df_ind.rename(columns={actual_d_col: 'Date'})
+            
+            if v_col in df_ind.columns:
+                master = master.merge(df_ind[['Date', v_col]], on='Date', how='left')
 
-    # CRITICAL FIX: Forward fill missing values so Feb 2026 shows Jan 2026 data
-    master = master.sort_values('Date').ffill()
-    
-    return master
+    # 3. Handle the OECD Consumer Confidence CSV (Special Formatting)
+    cci_file = "export-2026-02-10T06_50_22.597Z.csv"
+    if os.path.exists(cci_file):
+        # CSV has 3 lines of metadata
+        cci_df = pd.read_csv(cci_file, skiprows=3, names=['Date', 'CCI'])
+        cci_df['Date'] = pd.to_datetime(cci_df['Date'], errors='coerce')
+        cci_df = cci_df.dropna().set_index('Date').resample('MS').last().reset_index()
+        master = master.merge(cci_df, on='Date', how='left')
 
+    return master.ffill()
+
+# --- APP EXECUTION ---
 df = load_data()
-latest = df.iloc[-1] if not df.empty else None
 
-# --- Terminal Display Logic ---
 st.title("🏛️ INSTITUTIONAL MACRO TERMINAL")
 
-if latest is not None:
-    # Calculations
-    spread = latest.get('T10Y2Y', 0)
-    recession_risk = 30 + (spread * -10) # Simple inverse correlation model
+if not df.empty:
+    latest = df.iloc[-1]
     
-    col1, col2 = st.columns(2)
-    col1.metric("RECESSION RISK", f"{max(0, recession_risk):.1f}%")
-    col2.metric("YIELD SPREAD", f"{spread:.2f}")
-
-    col3, col4, col5 = st.columns(3)
+    # Dashboard Metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    # 10Y-2Y Spread & Recession Risk Calculation
+    spread = latest.get('T10Y2Y', 0.0)
+    risk = 25.0 if spread > 0 else 65.0 # Basic logic: Inversion increases risk
+    
+    col1.metric("RECESSION RISK", f"{risk}%")
+    col2.metric("YIELD SPREAD (10Y-2Y)", f"{spread:.2f}")
     col3.metric("CONS. CONFIDENCE", f"{latest.get('CCI', 0.0):.1f}")
     col4.metric("COMMODITY INDEX", f"{latest.get('PALLFNFINDEXM', 0.0):.1f}")
-    col5.metric("INR/USD", f"{latest.get('DEXINUS', 0.0):.2f}")
-    
+
     st.divider()
-    st.subheader("Historical Context")
-    st.line_chart(df.set_index('Date')[['T10Y2Y', 'CCI']])
+    
+    # Charts
+    st.subheader("Market Trends")
+    chart_data = df.set_index('Date')[['T10Y2Y', 'CCI', 'PALLFNFINDEXM']]
+    st.line_chart(chart_data)
+    
+    # Currency Table
+    st.subheader("Latest Spot Rates")
+    st.write(f"**INR/USD:** {latest.get('DEXINUS', 'N/A')}")
 else:
-    st.error("Data files not found. Please ensure XLSX files are in the directory.")
+    st.warning("Please check that your Excel files are uploaded to the root directory.")
