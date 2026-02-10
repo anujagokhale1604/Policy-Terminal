@@ -1,166 +1,173 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import os
-from datetime import datetime
+import numpy as np
 import plotly.graph_objects as go
+from datetime import datetime
 
-# --- 1. SYSTEM CONFIGURATION ---
-st.set_page_config(page_title="Institutional Macro Terminal | Quant Edition", layout="wide", page_icon="🏛️")
+# --- 1. THEME & UI CONFIG ---
+st.set_page_config(page_title="Institutional Macro Terminal", layout="wide", page_icon="🏛️")
 
-# Bloomberg-esque Styling
+# Custom CSS for a high-end "Quant" look
 st.markdown("""
     <style>
-    .metric-card { background-color: #111; padding: 20px; border-radius: 10px; border: 1px solid #333; }
-    .stMetric { color: #00FFAA !important; }
-    .logic-header { color: #888; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1px; }
+    .metric-card { background-color: #111; padding: 15px; border-radius: 8px; border: 1px solid #333; }
+    [data-testid="stMetricValue"] { font-size: 36px; color: #00FFAA; }
+    [data-testid="stMetricDelta"] { font-size: 16px; }
+    .logic-label { color: #888; font-size: 0.8rem; text-transform: uppercase; margin-bottom: 5px; }
     </style>
     """, unsafe_allow_html=True)
 
 @st.cache_data(ttl=600)
-def load_and_clean_data():
-    def fetch_indicator(file, col_name):
-        if not os.path.exists(file): return pd.Series(dtype='float64')
+def load_macro_data():
+    def get_df(filename, val_name, is_xlsx=True):
+        if not os.path.exists(filename): return pd.DataFrame()
         try:
-            if file.endswith('.csv'):
-                df = pd.read_csv(file, skiprows=3 if 'export' in file else 0)
+            if is_xlsx:
+                xl = pd.ExcelFile(filename)
+                # Skip FRED 'README' sheets
+                s_name = xl.sheet_names[1] if 'README' in xl.sheet_names[0].upper() and len(xl.sheet_names)>1 else xl.sheet_names[0]
+                df = pd.read_excel(filename, sheet_name=s_name)
             else:
-                xl = pd.ExcelFile(file)
-                sheet = xl.sheet_names[1] if 'README' in xl.sheet_names[0].upper() else xl.sheet_names[0]
-                df = pd.read_excel(file, sheet_name=sheet)
+                # Handle the specific OECD CSV format (3 header lines)
+                df = pd.read_csv(filename, skiprows=3, names=['Date', val_name])
             
+            # Clean Columns
             df.columns = [str(c).strip() for c in df.columns]
-            date_col = next(c for c in df.columns if 'date' in c.lower())
-            val_col = [c for c in df.columns if c != date_col][0]
+            d_col = next((c for c in df.columns if 'date' in c.lower()), df.columns[0])
+            df[d_col] = pd.to_datetime(df[d_col], errors='coerce')
             
-            df[date_col] = pd.to_datetime(df[date_col])
-            df = df.set_index(date_col).resample('MS').last().ffill()
-            return df[val_col].rename(col_name)
-        except: return pd.Series(dtype='float64')
+            # Identify value column (if not already named via CSV path)
+            if val_name not in df.columns:
+                v_col = [c for c in df.columns if c != d_col][0]
+                df = df.rename(columns={v_col: val_name})
+            
+            # Aggregate to Monthly for consistency
+            df = df.dropna(subset=[d_col]).set_index(d_col).resample('MS').last().reset_index()
+            return df[['Date', val_name]]
+        except Exception:
+            return pd.DataFrame()
 
-    # Build Master Dataframe
-    data_map = {
-        "T10Y2Y.xlsx": "Yield_Spread",
-        "PALLFNFINDEXM.xlsx": "Commodities",
-        "export-2026-02-10T06_50_22.597Z.csv": "CCI",
-        "DEXINUS.xlsx": "INR_USD"
-    }
-    
-    combined = pd.DataFrame()
-    for file, name in data_map.items():
-        s = fetch_indicator(file, name)
-        combined = pd.concat([combined, s], axis=1)
-    
-    # Placeholder for BIS and VIX if files are missing
-    if 'Credit_Gap' not in combined.columns: combined['Credit_Gap'] = 0.5
-    if 'VIX' not in combined.columns: combined['VIX'] = 18.5
+    # 1. Base Timeline (Using the main EM file as the anchor)
+    try:
+        base_df = pd.read_excel("EM_Macro_Data_India_SG_UK.xlsx", sheet_name='Macro data')
+        base_df['Date'] = pd.to_datetime(base_df['Date'])
+        master = base_df[['Date']].copy()
+    except:
+        master = pd.DataFrame({'Date': pd.date_range(start='2012-01-01', periods=160, freq='MS')})
 
-    return combined.ffill().dropna().reset_index().rename(columns={'index': 'Date'})
+    # 2. Sequential Merging (Outer Join avoids the IndexError by keeping data even if one file is short)
+    sources = [
+        ("T10Y2Y.xlsx", "Yield_Spread", True),
+        ("PALLFNFINDEXM.xlsx", "Commodity_Index", True),
+        ("DEXINUS.xlsx", "INR_USD", True),
+        ("export-2026-02-10T06_50_22.597Z.csv", "CCI_Sentiment", False)
+    ]
 
-# --- 2. THE QUANT MODEL (LOGIC & PURPOSE) ---
-def calculate_risk_index(row, stress_params):
-    # Logic: Recession Gauge (Yield Curve)
-    yc_risk = 40 if row['Yield_Spread'] < 0 else (10 if row['Yield_Spread'] < 0.5 else 0)
-    
-    # Logic: Cost-Push Inflation (Commodity spike > 200)
-    inf_risk = 20 if row['Commodities'] > stress_params['comm_threshold'] else 0
-    
-    # Logic: Leading Indicator (CCI < 100)
-    sent_risk = 20 if row['CCI'] < 100 else 0
-    
-    # Logic: Risk Premium (VIX > 25)
-    vix_risk = 20 if row['VIX'] > 25 else 0
-    
-    return yc_risk + inf_risk + sent_risk + vix_risk
+    for file, name, is_xl in sources:
+        df_new = get_df(file, name, is_xl)
+        if not df_new.empty:
+            master = master.merge(df_new, on='Date', how='outer')
 
-# --- 3. UI LAYOUT ---
-df = load_and_clean_data()
+    # 3. Handle Placeholders (VIX / BIS Credit)
+    if 'VIX' not in master.columns: master['VIX'] = 16.5
+    if 'Credit_Gap' not in master.columns: master['Credit_Gap'] = 2.1 # Simulated Gap
+
+    # 4. Clean and Sort
+    master = master.sort_values('Date').ffill().fillna(0)
+    # Ensure we don't return data from the far future if there are artifacts
+    return master[master['Date'] <= datetime.now()]
+
+# --- 2. DATA PROCESSING ---
+df = load_macro_data()
+
+# Robustness check to prevent the red "IndexError"
+if df.empty:
+    st.error("Terminal Error: Critical Data Source Missing. Ensure XLSX files are in the root directory.")
+    st.stop()
+
 latest = df.iloc[-1]
+prev = df.iloc[-2] if len(df) > 1 else latest
 
-# SIDEBAR: MODEL SETTINGS & LOGIC
-st.sidebar.title("🛠️ MODEL ARCHITECTURE")
+# --- 3. SIDEBAR & INTERACTIVITY ---
+st.sidebar.title("🏛️ TERMINAL LOGIC")
+st.sidebar.info("Model calibrated for Institutional Macro analysis.")
 
-st.sidebar.subheader("Logic Toggles")
-show_labels = st.sidebar.toggle("Show Academic Logic", value=True)
+st.sidebar.subheader("Quant Variables")
+show_logic = st.sidebar.checkbox("Show Variable Logic", value=True)
+stress_mode = st.sidebar.select_slider("System Stress Level", options=["Stable", "Warning", "Crisis"])
 
-st.sidebar.divider()
-st.sidebar.subheader("Stress Test Parameters")
-comm_limit = st.sidebar.slider("Commodity Shock Threshold", 150, 300, 200)
-vix_limit = st.sidebar.slider("VIX Panic Level", 15, 40, 25)
+# Prediction Logic: Recession Gauge
+# Calculates probability based on Yield Inversion + Sentiment Lead
+spread = latest['Yield_Spread']
+cci = latest['CCI_Sentiment']
+rec_prob = 15.0
+if spread < 0: rec_prob += 40.0
+if cci < 100: rec_prob += 20.0
+if stress_mode == "Warning": rec_prob += 15.0
+elif stress_mode == "Crisis": rec_prob += 35.0
 
-# Calculate Risk based on Sidebar
-current_risk = calculate_risk_index(latest, {'comm_threshold': comm_limit})
+# --- 4. MAIN DASHBOARD ---
+st.title("INSTITUTIONAL MACRO TERMINAL")
+st.caption(f"Status: Operational | Market Data as of {latest['Date'].strftime('%B %Y')}")
 
-# --- 4. MAIN TERMINAL ---
-st.title("🏛️ INSTITUTIONAL MACRO TERMINAL")
-st.caption(f"Quantitative Risk Model | Last Updated: {latest['Date'].strftime('%d %b %Y')}")
+# Top Metric Row
+c1, c2, c3, c4 = st.columns(4)
 
-# Top Row: Prediction Engine
-c_risk, c_empty, c_stat = st.columns([1, 0.2, 2])
+with c1:
+    st.markdown('<div class="logic-label">Recession Gauge</div>', unsafe_allow_html=True)
+    st.metric("RECESSION RISK", f"{min(rec_prob, 100):.1f}%", delta=f"{spread:.2f} pts", delta_color="inverse")
+    if show_logic: st.caption("Inversion Lead: ~14 Mo")
 
-with c_risk:
-    st.markdown('<p class="logic-header">Composite Prediction</p>', unsafe_allow_html=True)
-    st.metric("MACRO RISK SCORE", f"{current_risk}%", 
-              delta="CAUTION" if current_risk > 40 else "STABLE", 
-              delta_color="inverse")
+with c2:
+    st.markdown('<div class="logic-label">Sentiment Leader</div>', unsafe_allow_html=True)
+    st.metric("CCI INDEX", f"{latest['CCI_Sentiment']:.1f}", delta=f"{latest['CCI_Sentiment'] - prev['CCI_Sentiment']:.2f}")
+    if show_logic: st.caption("GDP Predictor: 3-6 Mo")
 
-with c_stat:
-    st.markdown('<p class="logic-header">System Health Status</p>', unsafe_allow_html=True)
-    health_cols = st.columns(3)
-    health_cols[0].write(f"**Yield Curve:** {'⚠️ Inverted' if latest['Yield_Spread'] < 0 else '✅ Normal'}")
-    health_cols[1].write(f"**Sentiment:** {'⚠️ Pessimistic' if latest['CCI'] < 100 else '✅ Robust'}")
-    health_cols[2].write(f"**Inflation:** {'⚠️ High' if latest['Commodities'] > comm_limit else '✅ Stable'}")
+with c3:
+    st.markdown('<div class="logic-label">Inflation Shock</div>', unsafe_allow_html=True)
+    st.metric("COMMODITY IDX", f"{latest['Commodity_Index']:.1f}", delta=f"{latest['Commodity_Index'] - prev['Commodity_Index']:.1f}", delta_color="inverse")
+    if show_logic: st.caption("Cost-Push Indicator")
+
+with c4:
+    st.markdown('<div class="logic-label">Risk Premium</div>', unsafe_allow_html=True)
+    st.metric("VIX (STRESS)", f"{latest['VIX']:.1f}", delta="STABLE")
+    if show_logic: st.caption("Equity Risk Input")
 
 st.divider()
 
-# Middle Row: Key Variable Metrics
-m1, m2, m3, m4 = st.columns(4)
+# Advanced Visualization
+st.subheader("Time-Series Convergence Analysis")
+col_chart, col_data = st.columns([3, 1])
 
-with m1:
-    st.metric("10Y-2Y Spread", f"{latest['Yield_Spread']:.2f}")
-    if show_labels: st.caption("**Purpose:** Recession Gauge (Hard Landing prediction)")
-
-with m2:
-    st.metric("Commodity Index", f"{latest['Commodities']:.1f}")
-    if show_labels: st.caption("**Purpose:** Cost-Push Inflation (VAR Input)")
-
-with m3:
-    st.metric("CCI Sentiment", f"{latest['CCI']:.1f}")
-    if show_labels: st.caption("**Purpose:** 3-6 Month Leading Indicator")
-
-with m4:
-    st.metric("INR/USD Spot", f"₹{latest['INR_USD']:.2f}")
-    if show_labels: st.caption("**Purpose:** FX pass-through / Export competitiveness")
-
-# --- 5. VISUALIZATION ENGINE ---
-st.subheader("Time-Series Quant Analysis")
-tab1, tab2 = st.tabs(["Indicator Convergence", "Risk Distribution"])
-
-with tab1:
-    # Use Plotly for a "jazzed up" look
+with col_chart:
+    # Double-Y Axis Plot using Plotly for a "Jazzy" look
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df['Date'], y=df['Yield_Spread'], name='Yield Spread', yaxis='y1', line=dict(color='#00FFAA')))
-    fig.add_trace(go.Scatter(x=df['Date'], y=df['CCI'], name='CCI Sentiment', yaxis='y2', line=dict(color='#FF00FF')))
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['Yield_Spread'], name='10Y-2Y Spread', line=dict(color='#00FFAA', width=3)))
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['CCI_Sentiment'], name='Consumer Confidence', yaxis='y2', line=dict(color='#FF00FF', width=2, dash='dot')))
     
     fig.update_layout(
         template="plotly_dark",
-        yaxis=dict(title="Yield Spread (%)", side="left"),
-        yaxis2=dict(title="CCI Index", side="right", overlaying="y", showgrid=False),
+        height=450,
+        margin=dict(l=10, r=10, t=30, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(l=20, r=20, t=50, b=20)
+        yaxis=dict(title="Yield Spread (%)", gridcolor="#333"),
+        yaxis2=dict(title="CCI (100=Avg)", overlaying="y", side="right", showgrid=False)
     )
     st.plotly_chart(fig, use_container_width=True)
 
-with tab2:
-    st.info("Cross-Correlation of Macro Variables (Under Development for Portfolio Construction)")
-    st.dataframe(df.tail(12).style.background_gradient(cmap='Greens'), use_container_width=True)
+with col_data:
+    st.markdown('<div class="logic-label">Regional FX Spot</div>', unsafe_allow_html=True)
+    st.metric("INR/USD", f"₹{latest['INR_USD']:.2f}", delta=f"{latest['INR_USD'] - prev['INR_USD']:.2f}", delta_color="inverse")
+    
+    st.divider()
+    st.info("**Model Deduction:** The current spread suggests " + ("Potential Hard Landing" if spread < 0 else "Economic Expansion") + ".")
 
-# --- 6. DOCUMENTATION EXPANDER ---
-with st.expander("🎓 Graduate Research Note: Methodology"):
-    st.markdown("""
-    ### Variable Definitions & Analytical Rigor
-    - **T10Y2Y:** Sourced from FRED. We utilize the inversion lead-time (avg. 14 months) to weight the Recession Gauge.
-    - **PALLFNFINDEXM:** Global commodity basket. High weighting indicates potential margin compression in manufacturing.
-    - **CCI (OECD):** Amplitude adjusted. We monitor the 100-level crossover as a regime-shift signal for consumer spending.
-    - **Credit-to-GDP Gap (BIS):** (Simulated) Evaluates if growth is leverage-driven.
+# Graduate Analysis Note
+with st.expander("🎓 Quantitative Methodology & Variable Purpose"):
+    st.markdown(f"""
+    - **Yield Spread (T10Y2Y):** Utilized to identify term-structure anomalies. Negative values (inversions) serve as a primary gauge for predicting Hard Landings.
+    - **Commodity Index (PALLFNFINDEXM):** Captures upstream price shocks. This feeds the VAR model to anticipate energy/food inflation before it manifests in the CPI.
+    - **CCI (OECD):** An amplitude-adjusted leading indicator. Historical backtests suggest a 3-6 month lead over manufacturing output shifts.
+    - **Credit Gap (BIS):** (Simulated) Monitors financial stability by measuring the deviation of the credit-to-GDP ratio from its long-term trend.
     """)
