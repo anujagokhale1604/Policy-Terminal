@@ -3,124 +3,121 @@ import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import os
-import numpy as np
 from scipy.stats import norm
 
-# --- 1. SETTINGS & UI ---
-st.set_page_config(page_title="Institutional Macro Terminal", layout="wide")
+# --- 1. SETTINGS ---
+st.set_page_config(page_title="Macro Quant Terminal", layout="wide")
 st.markdown("<style>*{font-family:'Times New Roman',serif;}.stApp{background-color:#FDFCFB;}</style>", unsafe_allow_html=True)
 
-# --- 2. ROBUST DATA ENGINE ---
+# --- 2. DATA PROCESSING ENGINE ---
 @st.cache_data
-def load_data():
-    def clean_df(df, val_name):
-        # Identify date column (usually 1st column)
-        d_col = next((c for c in df.columns if 'date' in str(c).lower()), df.columns[0])
-        df = df.rename(columns={d_col: 'Date', df.columns[1]: val_name})
-        # Force all dates to Monthly Start (2024-01-15 -> 2024-01-01)
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.to_period('M').dt.to_timestamp()
-        df[val_name] = pd.to_numeric(df[val_name], errors='coerce')
-        return df.dropna(subset=['Date'])
+def load_all_data():
+    def to_monthly(df, date_col, val_col):
+        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+        df[val_col] = pd.to_numeric(df[val_col], errors='coerce')
+        df = df.dropna(subset=[date_col])
+        # Force to 1st of the month for perfect merging
+        df['Date'] = df[date_col].dt.to_period('M').dt.to_timestamp()
+        return df[['Date', val_col]].groupby('Date').mean().reset_index()
 
     db = {}
     
-    # A. Yield Spread
+    # A. Yield Spread (Daily -> Monthly Mean)
     if os.path.exists("T10Y2Y.xlsx - Daily.csv"):
-        y = pd.read_csv("T10Y2Y.xlsx - Daily.csv")
-        db['yield'] = clean_df(y, 'Spread').groupby('Date').mean().reset_index()
+        df_y = pd.read_csv("T10Y2Y.xlsx - Daily.csv")
+        db['yield'] = to_monthly(df_y, 'observation_date', 'T10Y2Y')
 
-    # B. Commodities
+    # B. Commodities (Monthly)
     if os.path.exists("PALLFNFINDEXM.xlsx - Monthly.csv"):
-        c = pd.read_csv("PALLFNFINDEXM.xlsx - Monthly.csv")
-        db['comm'] = clean_df(c, 'Commodities')
+        df_c = pd.read_csv("PALLFNFINDEXM.xlsx - Monthly.csv")
+        db['comm'] = to_monthly(df_c, 'observation_date', 'PALLFNFINDEXM')
 
-    # C. Consumer Confidence (Skip 3 rows of headers)
+    # C. Consumer Confidence (OECD Format - No Header)
     if os.path.exists("export-2026-02-10T06_50_22.597Z.csv"):
-        cci = pd.read_csv("export-2026-02-10T06_50_22.597Z.csv", skiprows=3, header=None)
-        cci.columns = ['Date', 'CCI']
-        cci['Date'] = pd.to_datetime(cci['Date'], errors='coerce').dt.to_period('M').dt.to_timestamp()
-        db['cci'] = cci.dropna()
+        df_cci = pd.read_csv("export-2026-02-10T06_50_22.597Z.csv", skiprows=3, header=None)
+        df_cci.columns = ['Date_Raw', 'CCI']
+        db['cci'] = to_monthly(df_cci, 'Date_Raw', 'CCI')
 
-    # D. Primary Macro File (Policy Rates/CPI)
-    macro_file = "EM_Macro_Data_India_SG_UK.xlsx"
-    if os.path.exists(macro_file):
+    # D. Local Macro Data (India/UK/SG)
+    macro_path = "EM_Macro_Data_India_SG_UK.xlsx"
+    if os.path.exists(macro_path):
         try:
-            db['macro'] = pd.read_excel(macro_file, sheet_name="Macro data")
-            date_col = next((c for c in db['macro'].columns if 'date' in str(c).lower()), db['macro'].columns[0])
-            db['macro'][date_col] = pd.to_datetime(db['macro'][date_col], errors='coerce').dt.to_period('M').dt.to_timestamp()
-            db['macro'] = db['macro'].rename(columns={date_col: 'Date'}).dropna(subset=['Date'])
-        except: pass
-    
+            df_m = pd.read_excel(macro_path, sheet_name="Macro data")
+            d_col = next((c for c in df_m.columns if 'date' in str(c).lower()), df_m.columns[0])
+            # Process all columns in the excel file
+            df_m[d_col] = pd.to_datetime(df_m[d_col], errors='coerce')
+            df_m['Date'] = df_m[d_col].dt.to_period('M').dt.to_timestamp()
+            db['macro'] = df_m.drop(columns=[d_col]).groupby('Date').mean().reset_index()
+        except Exception as e:
+            st.sidebar.error(f"Excel Error: {e}")
+            
     return db
 
-# --- 3. ASSEMBLY ---
-db = load_data()
+# --- 3. MERGE & CLEAN ---
+data_dict = load_all_data()
 
-# Start with a base timeline using the Yield dates (most reliable)
-if 'yield' in db:
-    master_df = db['yield']
-else:
-    # If yield is missing, use whatever is available
-    first_key = list(db.keys())[0] if db else None
-    master_df = db[first_key] if first_key else pd.DataFrame(columns=['Date'])
+# Create a master timeline from 2000 to latest available date
+start_date = pd.to_datetime("2000-01-01")
+end_date = pd.to_datetime("2026-02-01")
+master_df = pd.DataFrame({'Date': pd.date_range(start=start_date, end=end_date, freq='MS')})
 
-# Join everything else
-for key in ['comm', 'cci', 'macro']:
-    if key in db:
-        master_df = master_df.merge(db[key], on='Date', how='outer')
+# Merge all datasets onto the master timeline
+for key in data_dict:
+    master_df = master_df.merge(data_dict[key], on='Date', how='left')
 
+# Forward fill missing data so lines are continuous
 master_df = master_df.sort_values('Date').ffill().bfill()
 
-# --- 4. THE DASHBOARD ---
+# --- 4. UI COMPONENTS ---
 st.title("🏛️ INSTITUTIONAL MACRO TERMINAL")
 
-# Metrics Calculation
-latest_spread = master_df['Spread'].iloc[-1] if 'Spread' in master_df.columns else 0.0
-latest_cci = master_df['CCI'].iloc[-1] if 'CCI' in master_df.columns else 0.0
-latest_comm = master_df['Commodities'].iloc[-1] if 'Commodities' in master_df.columns else 0.0
+# Market Selector
+market = st.sidebar.selectbox("Jurisdiction", ["India", "UK", "Singapore"])
+mappings = {
+    "India": {"policy": "Policy_India", "cpi": "CPI_India"},
+    "UK": {"policy": "Policy_UK", "cpi": "CPI_UK"},
+    "Singapore": {"policy": "Policy_Singapore", "cpi": "CPI_Singapore"}
+}
 
-# Recession Prob (Probit: Spread of 0.74 gives ~11%, Spread of 0 gives 30.9%)
-prob = norm.cdf(-0.5 - (1.5 * latest_spread)) * 100
+# Metrics
+latest = master_df.iloc[-1]
+spread = latest.get('T10Y2Y', 0.0)
+cci = latest.get('CCI', 0.0)
+comm = latest.get('PALLFNFINDEXM', 0.0)
+prob = norm.cdf(-0.5 - (1.5 * spread)) * 100 if spread != 0 else 0.0
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("RECESSION RISK", f"{prob:.1f}%")
-c2.metric("YIELD SPREAD", f"{latest_spread:.2f}")
-c3.metric("CONS. CONFIDENCE", f"{latest_cci:.1f}")
-c4.metric("COMMODITY INDEX", f"{latest_comm:.1f}")
-
-# Jurisdiction Toggle
-market = st.sidebar.selectbox("Jurisdiction", ["India", "UK", "Singapore"])
-m_cols = {"India": ["Policy_India", "CPI_India"], "UK": ["Policy_UK", "CPI_UK"], "Singapore": ["Policy_Singapore", "CPI_Singapore"]}
+c2.metric("YIELD SPREAD", f"{spread:.2f}")
+c3.metric("CONS. CONFIDENCE", f"{cci:.1f}")
+c4.metric("COMMODITY INDEX", f"{comm:.0f}")
 
 # --- 5. GRAPHS ---
-fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.07,
-                    subplot_titles=("Jurisdiction Policy & Inflation", "Global Macro Drivers"))
+fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
+                    subplot_titles=(f"{market}: Policy vs Inflation", "Global Macro Sentiment"))
 
-# Chart 1: Local Policy
-p_col, c_col = m_cols[market]
+# Subplot 1: Local Policy
+p_col = mappings[market]['policy']
+c_col = mappings[market]['cpi']
+
 if p_col in master_df.columns:
     fig.add_trace(go.Scatter(x=master_df['Date'], y=master_df[p_col], name="Policy Rate", line=dict(color='#002366', width=3)), row=1, col=1)
     fig.add_trace(go.Scatter(x=master_df['Date'], y=master_df[c_col], name="CPI Inflation", line=dict(color='#A52A2A', dash='dot')), row=1, col=1)
 else:
-    st.sidebar.warning(f"Data for {market} not found in Excel file. Check column names.")
+    st.info(f"Please upload '{macro_path}' to see {market} specific charts.")
 
-# Chart 2: Global Indicators
-if 'Spread' in master_df.columns:
-    fig.add_trace(go.Scatter(x=master_df['Date'], y=master_df['Spread'], name="Yield Spread", fill='tozeroy', line=dict(color='#2E8B57')), row=2, col=1)
-if 'Commodities' in master_df.columns:
-    fig.add_trace(go.Scatter(x=master_df['Date'], y=master_df['Commodities'], name="Commodities", line=dict(color='#C5A059')), row=2, col=1)
+# Subplot 2: Global Sentiment
+if 'T10Y2Y' in master_df.columns:
+    fig.add_trace(go.Scatter(x=master_df['Date'], y=master_df['T10Y2Y'], name="Yield Spread", fill='tozeroy', line=dict(color='#2E8B57')), row=2, col=1)
+if 'CCI' in master_df.columns:
+    fig.add_trace(go.Scatter(x=master_df['Date'], y=master_df['CCI'], name="Consumer Sentiment", line=dict(color='#C5A059')), row=2, col=1)
 
-fig.update_layout(height=800, template="plotly_white")
+fig.update_layout(height=800, template="plotly_white", showlegend=True, margin=dict(l=20, r=20, t=50, b=20))
 st.plotly_chart(fig, use_container_width=True)
 
-# --- 6. PREDICTIVE INSIGHTS ---
-st.subheader("🔮 Predictive Intelligence")
-if latest_spread > 0.5:
-    st.success(f"**Bullish Bias:** The yield spread of {latest_spread:.2f} is healthy. Markets are pricing in expansion, keeping recession risk low at {prob:.1f}%.")
-elif latest_spread < 0:
-    st.error(f"**Inversion Warning:** The yield spread is negative. Historically, this is a 12-month lead indicator for recession.")
-else:
-    st.warning("**Flat Curve:** The yield spread is tightening. This often precedes a shift in Central Bank policy.")
-
-if 'macro' not in db:
-    st.info("💡 **Tip:** To see the Policy and Inflation charts, upload 'EM_Macro_Data_India_SG_UK.xlsx' to your root folder.")
+# Status Footer
+with st.expander("System Data Status"):
+    for key, df in data_dict.items():
+        st.write(f"✅ {key.upper()}: {len(df)} records found.")
+    if "macro" not in data_dict:
+        st.warning("❌ LOCAL MACRO FILE NOT FOUND (EM_Macro_Data_India_SG_UK.xlsx)")
