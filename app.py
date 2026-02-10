@@ -7,100 +7,122 @@ from statsmodels.tsa.api import VAR
 from datetime import datetime
 
 # --- 1. SYSTEM CONFIG ---
-st.set_page_config(page_title="Macro Quant Terminal | VAR", layout="wide")
+st.set_page_config(page_title="Macro Quant Terminal | VAR", layout="wide", page_icon="🏛️")
 
 @st.cache_data(ttl=600)
-def load_data():
-    # ... (Keeping your existing robust loading logic from previous turn)
-    # Ensure we return a cleaned, monthly-indexed dataframe 'df'
-    # For this example, I'll assume 'df' has: Date, Yield_Spread, Commodities, Sentiment, INR_USD
-    return df 
+def load_macro_data():
+    """Robust data loader that aligns all macro sources."""
+    def get_series(file, sheet=None, col_name="Value", is_csv=False, skip=0):
+        if not os.path.exists(file): return pd.Series(dtype='float64')
+        try:
+            if is_csv:
+                # Optimized for your specific OECD CSV export
+                df = pd.read_csv(file, skiprows=skip, names=['Date', col_name])
+            else:
+                xl = pd.ExcelFile(file)
+                target_sheet = sheet if sheet in xl.sheet_names else xl.sheet_names[-1]
+                df = pd.read_excel(file, sheet_name=target_sheet)
+            
+            df.columns = [str(c).strip() for c in df.columns]
+            date_col = next(c for c in df.columns if 'date' in c.lower() or 'time' in c.lower())
+            val_col = [c for c in df.columns if c != date_col][0]
+            df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+            return df.dropna(subset=[date_col]).set_index(date_col)[val_col].resample('MS').last().rename(col_name)
+        except: return pd.Series(dtype='float64')
+
+    # Mapping your .xlsx and .csv files
+    map_dict = {
+        "Yield_Spread": get_series("T10Y2Y.xlsx", sheet="Daily", col_name="Yield_Spread"),
+        "Commodities": get_series("PALLFNFINDEXM.xlsx", sheet="Monthly", col_name="Commodities"),
+        "Sentiment": get_series("export-2026-02-10T06_50_22.597Z.csv", is_csv=True, skip=4, col_name="Sentiment"),
+        "INR_USD": get_series("DEXINUS.xlsx", sheet="Daily", col_name="INR_USD")
+    }
+    
+    # Concatenate and clean
+    master_df = pd.concat(map_dict.values(), axis=1).sort_index().ffill().dropna()
+    return master_df.reset_index().rename(columns={'index': 'Date'})
 
 # --- 2. VAR FORECASTING ENGINE ---
 def run_var_forecast(data, steps=3):
     """
-    Implements a Vector Autoregression model to predict future macro shifts.
-    steps=3 represents a 3-month outlook.
+    Vector Autoregression: Models the endogenous relationship between 
+    Yields, Commodities, Sentiment, and FX.
     """
-    # Prepare data for VAR: numeric only, no missing values
-    var_data = data[['Yield_Spread', 'Commodities', 'Sentiment', 'INR_USD']].dropna()
+    var_df = data[['Yield_Spread', 'Commodities', 'Sentiment', 'INR_USD']]
     
-    # Fit VAR Model
-    model = VAR(var_data)
-    # We use AIC to pick the best lag (usually 1 or 2 for monthly macro data)
-    results = model.fit(maxlags=2, ic='aic')
+    # Fit model (Lag Order 1 is standard for monthly macro data)
+    model = VAR(var_df)
+    results = model.fit(1)
     
-    # Forecast
-    forecast_values = results.forecast(var_data.values[-results.k_ar:], steps)
+    # Forecast steps ahead
+    forecast_values = results.forecast(var_df.values[-results.k_ar:], steps)
     
-    # Create Forecast DataFrame
+    # Generate future dates
     last_date = data['Date'].max()
     forecast_dates = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=steps, freq='MS')
     
-    forecast_df = pd.DataFrame(forecast_values, columns=var_data.columns, index=forecast_dates)
-    return forecast_df
+    return pd.DataFrame(forecast_values, columns=var_df.columns, index=forecast_dates)
 
-# --- 3. UI EXECUTION ---
-df = load_data()
+# --- 3. EXECUTION ---
+df = load_macro_data()
+
+if df.empty:
+    st.error("Data missing. Please check your Excel files.")
+    st.stop()
+
+# Run Prediction
 forecast_df = run_var_forecast(df)
+latest = df.iloc[-1]
+future = forecast_df.iloc[-1]
 
+# --- 4. DASHBOARD UI ---
 st.title("🏛️ INSTITUTIONAL MACRO QUANT TERMINAL")
-st.subheader("Statistical Predictive Engine (VAR Model)")
+st.markdown(f"**Predictive Regime:** Vector Autoregression (VAR) | **Outlook:** {forecast_df.index[-1].strftime('%B %Y')}")
 
-# --- 4. PREDICTION DASHBOARD ---
-p1, p2, p3 = st.columns(3)
-
-# VAR Prediction Logic for Grad Level
-target_month = forecast_df.index[-1].strftime('%B %Y')
-proj_inr = forecast_df['INR_USD'].iloc[-1]
-proj_spread = forecast_df['Yield_Spread'].iloc[-1]
-
-with p1:
-    st.metric(f"Projected INR/USD ({target_month})", f"₹{proj_inr:.2f}", 
-              delta=f"{proj_inr - df['INR_USD'].iloc[-1]:+.2f} (Model)")
-    st.caption("VAR Forecast based on Commodity/Spread covariance.")
-
-with p2:
-    st.metric(f"Projected Yield Spread", f"{proj_spread:.2f}%", 
-              delta="Steepening" if proj_spread > df['Yield_Spread'].iloc[-1] else "Flattening")
-    st.caption("Monetary policy trajectory simulation.")
-
-with p3:
-    # Calculate a Forecasted Risk Score
-    f_risk = 100
-    if proj_spread < 0: f_risk -= 40
-    if forecast_df['Sentiment'].iloc[-1] < 100: f_risk -= 20
-    
-    st.metric("3-Month Risk Outlook", f"{f_risk}/100", 
-              delta=f"{f_risk - 80:+.0f} vs Present")
+# Summary Metrics
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Current INR/USD", f"₹{latest['INR_USD']:.2f}")
+c2.metric("VAR Projection (3M)", f"₹{future['INR_USD']:.2f}", 
+          delta=f"{future['INR_USD'] - latest['INR_USD']:+.2f}")
+c3.metric("Projected Spread", f"{future['Yield_Spread']:.2f}%", 
+          delta="Steepening" if future['Yield_Spread'] > latest['Yield_Spread'] else "Flattening")
+c4.metric("Sentiment Trend", f"{future['Sentiment']:.1f}", 
+          delta=f"{future['Sentiment'] - latest['Sentiment']:+.1f}")
 
 st.divider()
 
-# --- 5. FORECAST VISUALIZATION ---
-st.write("### Impulse Response Simulation (Projected Path)")
-
+# --- 5. VISUALIZING THE PREDICTION ---
+st.subheader("Time-Series Convergence & Prediction Path")
 
 
 fig = go.Figure()
 
-# Historical
-fig.add_trace(go.Scatter(x=df['Date'].tail(12), y=df['INR_USD'].tail(12), 
-                         name='Historical INR', line=dict(color='#00FFAA')))
+# Plot Historical INR/USD
+fig.add_trace(go.Scatter(x=df['Date'].tail(24), y=df['INR_USD'].tail(24), 
+                         name='Historical Spot', line=dict(color='#00FFAA', width=3)))
 
-# Forecast
-fig.add_trace(go.Scatter(x=forecast_df.index, y=forecast_df['INR_USD'], 
-                         name='VAR Projection', line=dict(color='#FF00FF', dash='dash')))
+# Plot VAR Forecasted INR/USD
+# Connect the last historical point to the first forecast point for a continuous line
+connect_dates = [df['Date'].iloc[-1], forecast_df.index[0]]
+connect_values = [df['INR_USD'].iloc[-1], forecast_df['INR_USD'].iloc[0]]
 
-fig.update_layout(template="plotly_dark", height=400, title="INR/USD: VAR Multi-Step Forecast")
+fig.add_trace(go.Scatter(x=connect_dates + list(forecast_df.index[1:]), 
+                         y=connect_values + list(forecast_df['INR_USD'].iloc[1:]), 
+                         name='VAR Prediction', line=dict(color='#FF00FF', width=3, dash='dot')))
+
+fig.update_layout(template="plotly_dark", height=450, 
+                  xaxis_title="Timeline", yaxis_title="INR/USD Exchange Rate",
+                  legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
 st.plotly_chart(fig, use_container_width=True)
 
-with st.expander("🎓 Technical Note on VAR Endogeneity"):
-    st.markdown("""
-    The **Vector Autoregression (VAR)** model captures the linear interdependencies among multiple time series. 
-    Unlike simple regression, VAR treats all variables as endogenous. 
+# Academic Context
+with st.expander("🎓 Technical Methodology: Vector Autoregression (VAR)"):
+    st.markdown(f"""
+    The VAR model identifies the lead-lag relationship between these variables. 
+    Unlike a standard regression which assumes $X$ causes $Y$, VAR acknowledges that:
+    1. **Yield Spreads** influence **Sentiment** (recession fears).
+    2. **Commodities** (inflation) influence **Yields** (policy response).
+    3. Both influence the **INR/USD** capital flows.
     
-    **Current Equation System:**
-    $$y_t = A_1 y_{t-1} + \dots + A_p y_{t-p} + u_t$$
-    where $y_t$ is a vector of [Spread, Commodities, Sentiment, FX]. This allows the model to capture how a 
-    spike in Commodities (Inflation) affects the Yield Spread (Policy Response) and subsequently the INR/USD exchange rate.
+    The system of equations is solved simultaneously to provide the path of least resistance for the next 90 days.
     """)
