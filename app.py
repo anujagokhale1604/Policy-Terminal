@@ -26,23 +26,27 @@ st.markdown("""
 def load_and_merge_data():
     try:
         # A. Primary Macro Workbook
-        # Assuming the original xlsx file is present
-        xl = pd.ExcelFile('EM_Macro_Data_India_SG_UK.xlsx')
-        df_m = xl.parse('Macro data')
+        df_m = pd.read_excel('EM_Macro_Data_India_SG_UK.xlsx', sheet_name='Macro data')
         df_m['Date'] = pd.to_datetime(df_m['Date'])
         
-        # B. Yield Curve (Handling Daily -> Monthly Resampling)
-        df_yield = pd.read_csv('T10Y2Y.xlsx - Daily.csv')
-        df_yield['observation_date'] = pd.to_datetime(df_yield['observation_date'])
-        # Standard Econ practice: Use the monthly mean for macro models
-        df_yield = df_yield.set_index('observation_date').resample('MS').mean().reset_index().rename(columns={'observation_date': 'Date'})
+        # B. Yield Curve (XLSX - Resampling Daily to Monthly)
+        # Note: FRED Excel downloads usually put the data in a sheet named 'Daily' or 'Observation'
+        df_yield = pd.read_excel('T10Y2Y.xlsx') 
+        # Identify date and value columns dynamically
+        d_col = [c for c in df_yield.columns if 'date' in str(c).lower()][0]
+        v_col = [c for c in df_yield.columns if 'T10' in str(c) or '2Y' in str(c)][0]
+        df_yield[d_col] = pd.to_datetime(df_yield[d_col])
+        df_yield = df_yield.set_index(d_col).resample('MS').mean().reset_index().rename(columns={d_col: 'Date', v_col: 'T10Y2Y'})
         
-        # C. Commodity Index (Monthly)
-        df_comm = pd.read_csv('PALLFNFINDEXM.xlsx - Monthly.csv')
-        df_comm['Date'] = pd.to_datetime(df_comm['observation_date'])
-        df_comm = df_comm[['Date', 'PALLFNFINDEXM']]
+        # C. Commodity Index (XLSX)
+        df_comm = pd.read_excel('PALLFNFINDEXM.xlsx')
+        c_d_col = [c for c in df_comm.columns if 'date' in str(c).lower()][0]
+        c_v_col = [c for c in df_comm.columns if 'PALL' in str(c)][0]
+        df_comm['Date'] = pd.to_datetime(df_comm[c_d_col])
+        df_comm = df_comm[['Date', c_v_col]].rename(columns={c_v_col: 'PALLFNFINDEXM'})
 
-        # D. Consumer Confidence Index (CSV with header rows)
+        # D. Consumer Confidence Index (The specific CSV file)
+        # Skipping meta-data headers usually found in OECD CSVs
         df_cci = pd.read_csv('export-2026-02-10T06_50_22.597Z.csv', skiprows=4, header=None, names=['Date', 'CCI'])
         df_cci['Date'] = pd.to_datetime(df_cci['Date'])
 
@@ -58,22 +62,20 @@ def load_and_merge_data():
 
 # --- 3. ECONOMETRIC CALCS ---
 def get_recession_prob(spread):
-    """Probit-style recession probability based on yield curve inversion"""
-    # Simplified institutional logic: Prob rises as spread drops below 0
     return norm.cdf(-0.5 - (1.5 * spread))
 
 # --- 4. DASHBOARD RENDER ---
 df = load_and_merge_data()
 
-with st.sidebar:
-    st.markdown("<h2>NAVIGATE</h2>", unsafe_allow_html=True)
-    market = st.selectbox("1. SELECT MARKET", ["India", "UK", "Singapore"])
-    forecast_len = st.slider("2. VAR FORECAST HORIZON", 6, 24, 12)
-    st.divider()
-    st.markdown("<b>VAR SETTINGS</b>")
-    lags = st.number_input("Model Lags (Months)", 1, 12, 6)
-
 if df is not None:
+    with st.sidebar:
+        st.markdown("<h2>NAVIGATE</h2>", unsafe_allow_html=True)
+        market = st.selectbox("1. SELECT MARKET", ["India", "UK", "Singapore"])
+        forecast_len = st.slider("2. VAR FORECAST HORIZON", 6, 24, 12)
+        st.divider()
+        st.markdown("<b>VAR SETTINGS</b>")
+        lags = st.number_input("Model Lags (Months)", 1, 12, 6)
+
     m_map = {
         "India": {"p": "Policy_India", "cpi": "CPI_India", "gdp": "GDP_India", "sym": "INR"},
         "UK": {"p": "Policy_UK", "cpi": "CPI_UK", "gdp": "GDP_UK", "sym": "GBP"},
@@ -82,7 +84,6 @@ if df is not None:
     m = m_map[market]
     
     # --- VAR MODELING ---
-    # We include Policy Rate, CPI, and Commodities as endogenous variables
     var_cols = [m['p'], m['cpi'], 'PALLFNFINDEXM']
     model_df = df[var_cols].dropna()
     var_model = VAR(model_df)
@@ -102,44 +103,24 @@ if df is not None:
     c4.metric("CONS. CONFIDENCE", f"{df['CCI'].iloc[-1]:.1f}")
 
     # CHARTS
-    st.markdown("<div class='section-header'><i class='fas fa-microchip'></i> I. Endogenous Multi-Variable Projections</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-header'>I. Endogenous Multi-Variable Projections</div>", unsafe_allow_html=True)
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, 
                         subplot_titles=("Policy & Inflation Path", "Yield Curve (Recession Predictor)"))
     
     fig.add_trace(go.Scatter(x=df['Date'], y=df[m['p']], name="Policy Rate", line=dict(color='#002366', width=3)), row=1, col=1)
     fig.add_trace(go.Scatter(x=df['Date'], y=df[m['cpi']], name="CPI (YoY)", line=dict(color='#A52A2A', dash='dot')), row=1, col=1)
-    
     fig.add_trace(go.Scatter(x=df['Date'], y=df['T10Y2Y'], name="Yield Spread (10Y-2Y)", fill='tozeroy', line=dict(color='#2E8B57')), row=2, col=1)
     
     fig.update_layout(height=550, template="plotly_white", margin=dict(l=20, r=20, t=30, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
-    # ANALYST NOTES
-    st.markdown("<div class='section-header'><i class='fas fa-file-contract'></i> II. Analyst Intelligence Note</div>", unsafe_allow_html=True)
-    st.markdown(f"""
-    <div class='analyst-card'>
-    <b>Model Insight:</b> The Vector Autoregression (VAR) model accounts for the feedback loop between commodity prices and local policy. 
-    Current data shows a yield spread of <b>{curr_spread:.2f}bps</b>. Historically, inversions of this magnitude imply a 
-    <b>{rec_prob*100:.1f}%</b> probability of a hard landing within 18 months. 
-    The CCI at <b>{df['CCI'].iloc[-1]:.1f}</b> indicates consumer sentiment is {'stable' if df['CCI'].iloc[-1] > 100 else 'deteriorating'}.
-    </div>
-    """, unsafe_allow_html=True)
+    # ANALYST NOTES & RECOMMENDATIONS
+    st.markdown("<div class='section-header'>II. Analyst Intelligence Note</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='analyst-card'><b>Macro Insight:</b> The model uses endogenous feedback between commodities and policy. Yield spread at <b>{curr_spread:.2f}</b> implies a <b>{rec_prob*100:.1f}%</b> recession risk.</div>", unsafe_allow_html=True)
 
-    # RECOMMENDATIONS
-    st.markdown("<div class='section-header'><i class='fas fa-briefcase'></i> III. Portfolio Recommendations</div>", unsafe_allow_html=True)
-    st.markdown(f"""
-    <div class='for-you-card'>
-    <b>Institutional Positioning:</b><br>
-    • <b>Interest Rate Risk:</b> The VAR path suggests a terminal equilibrium of {forecast[-1, 0]:.2f}%. Investors should {'lock in yields' if forecast[-1, 0] < df[m['p']].iloc[-1] else 'stay floating'} to optimize carry.<br>
-    • <b>Inflation Hedge:</b> With Global Commodities at {df['PALLFNFINDEXM'].iloc[-1]:.1f}, supply-side pressure remains {'elevated' if df['PALLFNFINDEXM'].iloc[-1] > 150 else 'moderate'}. Diversification into hard assets is recommended.
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown("<div class='section-header'>III. Portfolio Recommendations</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='for-you-card'><b>Positioning:</b> Terminal rate target: {forecast[-1, 0]:.2f}%. Adjusted sentiment (CCI: {df['CCI'].iloc[-1]:.1f}) suggests {'defensive' if df['CCI'].iloc[-1] < 100 else 'growth'} bias.</div>", unsafe_allow_html=True)
 
-    # LATEX
-    st.markdown("<div class='section-header'>Econometric Specification</div>", unsafe_allow_html=True)
-    st.latex(r'''
-    Y_t = C + \sum_{i=1}^{p} \Phi_i Y_{t-i} + \epsilon_t, \quad Y = [Policy, CPI, Commodities]^T
-    ''')
-
+    st.latex(r'''Y_t = C + \sum_{i=1}^{p} \Phi_i Y_{t-i} + \epsilon_t''')
 else:
-    st.error("Missing required data files. Ensure Excel and CSVs are in the directory.")
+    st.error("Missing required data files. Ensure 'EM_Macro_Data_India_SG_UK.xlsx', 'T10Y2Y.xlsx', 'PALLFNFINDEXM.xlsx', and the CSV are in the same folder.")
