@@ -5,12 +5,10 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime
-from scipy.stats import zscore
 
 # --- 1. RESEARCH ENGINE CONFIG ---
 st.set_page_config(page_title="Macro Quant Terminal", layout="wide", page_icon="🏛️")
 
-# Institutional "Bloomberg" Aesthetic
 st.markdown("""
     <style>
     [data-testid="stMetricValue"] { font-family: 'IBM Plex Mono', monospace; color: #00FFAA; }
@@ -47,14 +45,21 @@ def load_macro_universe():
     universe = pd.concat(map.values(), axis=1).sort_index().ffill().dropna(how='all')
     return universe.reset_index().rename(columns={'index': 'Date'})
 
-# --- 2. DATA LOAD & RISK MODEL ---
+# --- 2. DATA LOAD & ANALYTICS ---
 df = load_macro_universe()
 if df.empty:
     st.error("Terminal Offline: Data Load Failed.")
     st.stop()
 
-# Scoring Logic (Grad-level Probit-style weights)
+# Pandas-native Z-Score Calculation (Fixes the AttributeError)
+sent_mean = df['Sentiment'].mean()
+sent_std = df['Sentiment'].std()
+df['Sentiment_Z'] = (df['Sentiment'] - sent_mean) / sent_std
+
 latest = df.iloc[-1]
+z_score_latest = latest['Sentiment_Z']
+
+# Scoring Logic
 risk_score = 100
 if latest['Yield_Spread'] < 0: risk_score -= 40
 if latest['Sentiment'] < 100: risk_score -= 20
@@ -62,29 +67,41 @@ if latest['Commodities'] > 200: risk_score -= 15
 
 # --- 3. UI: TOP LEVEL DASHBOARD ---
 st.title("🏛️ INSTITUTIONAL MACRO QUANT TERMINAL")
-st.caption(f"Econometric Monitor | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+st.caption(f"Econometric Monitor | System Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
 c_risk, c_regime = st.columns([1, 2.5])
 
 with c_risk:
     st.markdown('<p class="logic-header">System Risk Score</p>', unsafe_allow_html=True)
-    st.metric("MACRO SCORE", f"{risk_score}/100", f"{risk_score - 75:+.1f} vs Base")
+    st.metric("MACRO SCORE", f"{risk_score}/100", f"{risk_score - 80:+.1f} vs Previous")
 
 with c_regime:
-    regime = "EXPANSIONARY" if risk_score > 75 else "LATE-CYCLE CAUTION"
-    if latest['Yield_Spread'] < 0: regime = "RECESSIONARY SIGNAL"
+    # Regime Logic
+    if latest['Yield_Spread'] < 0:
+        regime = "RECESSIONARY SIGNAL (INVERTED)"
+        box_color = "#FF4B4B"
+    elif risk_score > 75:
+        regime = "EXPANSIONARY / ROBUST"
+        box_color = "#00FFAA"
+    else:
+        regime = "LATE-CYCLE CAUTION"
+        box_color = "#FFAA00"
+        
     st.markdown(f"""
-        <div class="status-box">
+        <div class="status-box" style="border-left: 5px solid {box_color};">
             <span class="logic-header">Market Regime</span><br>
             <span style="font-size: 1.5rem; color: white;">{regime}</span><br>
-            <small style="color:#666;">Signals: Yield Inversion ({latest['Yield_Spread']:.2f}%) | Sentiment Z-Score ({zscore(df['Sentiment'].fillna(100)).iloc[-1]:.2f}σ)</small>
+            <small style="color:#666;">
+                Signals: Yield Spread ({latest['Yield_Spread']:.2f}%) | 
+                Sentiment Z-Score ({z_score_latest:.2f}σ)
+            </small>
         </div>
     """, unsafe_allow_html=True)
 
 st.divider()
 
-# --- 4. ADVANCED VISUALIZATION ---
-tab1, tab2, tab3 = st.tabs(["Convergence Analysis", "Cross-Asset Correlation", "Logic Notes"])
+# --- 4. VISUALIZATION ---
+tab1, tab2, tab3 = st.tabs(["Convergence Analysis", "Correlation Matrix", "Logic Methodology"])
 
 with tab1:
     fig = go.Figure()
@@ -94,30 +111,22 @@ with tab1:
     st.plotly_chart(fig, use_container_width=True)
 
 with tab2:
-    st.write("### Pearson Correlation Heatmap (Interactive)")
-    # Replaced the buggy Pandas Styler with an interactive Plotly Heatmap
+    st.write("### Pearson Correlation Heatmap")
     corr_matrix = df[['Yield_Spread', 'Commodities', 'Sentiment', 'INR_USD']].tail(36).corr()
-    
-    fig_heat = px.imshow(
-        corr_matrix,
-        text_auto=".2f",
-        color_continuous_scale='RdYlGn',
-        aspect="auto",
-        template="plotly_dark"
-    )
+    fig_heat = px.imshow(corr_matrix, text_auto=".2f", color_continuous_scale='RdYlGn', template="plotly_dark")
     st.plotly_chart(fig_heat, use_container_width=True)
 
 with tab3:
     st.markdown("""
-    ### Variable Purpose & Logic
-    * **T10Y2Y Spread:** Used as the primary **Recession Gauge**. Curve inversion leads economic downturns by ~12-18 months.
-    * **PALLFNFINDEXM:** Global commodity basket to track **Cost-Push Inflation**. Predicts CPI shocks.
-    * **OECD CCI:** Amplitude-adjusted **Leading Indicator**. Standardized at 100; values below indicate consumer retrenchment.
+    ### Variable Definitions
+    - **Yield Spread:** The 10Y minus 2Y Treasury yield. A negative value (inversion) is a highly reliable recession predictor.
+    - **Sentiment (CCI):** OECD Consumer Confidence Index. 100 is the long-term trend; deviations indicate momentum.
+    - **Commodities:** Global price index used to gauge cost-push inflationary pressure on industrial margins.
     """)
 
-# --- 5. KEY INDICATOR GRID ---
+# --- 5. INDICATOR GRID ---
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("10Y-2Y Spread", f"{latest['Yield_Spread']:.2f}%")
 m2.metric("Commodity Index", f"{latest['Commodities']:.1f}")
 m3.metric("CCI Sentiment", f"{latest['Sentiment']:.1f}")
-m4.metric("INR/USD Spot", f"{latest['INR_USD']:.2f}")
+m4.metric("INR/USD Spot", f"₹{latest['INR_USD']:.2f}")
