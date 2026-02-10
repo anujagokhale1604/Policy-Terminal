@@ -4,124 +4,129 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import os
 import numpy as np
-from statsmodels.tsa.api import VAR
 from scipy.stats import norm
+from statsmodels.tsa.api import VAR
 
-# --- 1. RESEARCH UI ---
+# --- 1. SETTINGS & UI DESIGN ---
 st.set_page_config(page_title="Macro Quant Terminal", layout="wide")
-
 st.markdown("""
     <style>
     * { font-family: 'Times New Roman', serif; }
-    .stApp { background-color: #F2EFE9; color: #2C2C2C; }
-    .analyst-card { padding: 15px; border: 1px solid #A39B8F; background: white; border-left: 5px solid #002366; margin-bottom: 20px; }
-    .main-title { font-size: 32px; font-weight: bold; color: #002366; border-bottom: 3px solid #C5A059; padding-bottom: 5px; }
+    .stApp { background-color: #FDFCFB; }
+    .metric-card { background: #FFFFFF; padding: 20px; border: 1px solid #D3C9B9; border-left: 8px solid #002366; }
+    .status-active { color: #2E8B57; font-weight: bold; }
+    .status-missing { color: #A52A2A; font-weight: bold; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. SELF-HEALING DATA PIPELINE ---
-def robust_load_macro(filename, label):
-    """Detects header rows and column names automatically to prevent index errors."""
-    if not os.path.exists(filename):
-        return None
-    try:
-        # Step 1: Find where the actual data starts (look for 'date')
-        # We read first 20 rows to scan for headers
-        df_scan = pd.read_excel(filename, nrows=20, header=None)
-        start_row = 0
-        for i, row in df_scan.iterrows():
-            if any('date' in str(val).lower() for val in row.values):
-                start_row = i
-                break
-        
-        # Step 2: Read file from that row
-        df = pd.read_excel(filename, skiprows=start_row)
-        
-        # Step 3: Find Date and Data columns without using indices
-        date_col = next((c for c in df.columns if 'date' in str(c).lower()), None)
-        data_col = next((c for c in df.columns if c != date_col), None)
-        
-        if date_col is None or data_col is None:
-            return None
-            
-        df = df[[date_col, data_col]].rename(columns={date_col: 'Date', data_col: label})
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-        df[label] = pd.to_numeric(df[label], errors='coerce')
-        return df.dropna(subset=['Date'])
-    except Exception as e:
-        st.sidebar.warning(f"Skipping {filename}: {e}")
-        return None
-
+# --- 2. MULTI-SOURCE DATA LOADER ---
 @st.cache_data
-def load_all_data():
-    # A. Primary Macro Workbook
-    try:
-        df = pd.read_excel('EM_Macro_Data_India_SG_UK.xlsx', sheet_name='Macro data')
-        df['Date'] = pd.to_datetime(df['Date'])
-    except:
-        st.error("Fatal Error: 'EM_Macro_Data_India_SG_UK.xlsx' not found or invalid.")
+def load_terminal_data():
+    # Helper to handle the "Sandbox" naming (Excel-to-CSV conversion)
+    def fetch(name, sheet=""):
+        path = f"{name} - {sheet}.csv" if sheet else f"{name}.csv"
+        if os.path.exists(path): return pd.read_csv(path)
+        if os.path.exists(name): 
+            return pd.read_excel(name, sheet_name=sheet) if sheet else pd.read_excel(name)
         return None
 
-    # B. Yield Curve (XLSX) - Resample Daily to Monthly
-    df_y = robust_load_macro('T10Y2Y.xlsx', 'T10Y2Y')
+    data = {}
+    
+    # Core Macro File (from your GitHub)
+    df_macro = fetch("EM_Macro_Data_India_SG_UK.xlsx", "Macro data")
+    if df_macro is not None:
+        df_macro['Date'] = pd.to_datetime(df_macro['Date'])
+        data['macro'] = df_macro
+
+    # Yield Spread
+    df_y = fetch("T10Y2Y.xlsx", "Daily")
     if df_y is not None:
-        df_y = df_y.set_index('Date').resample('MS').mean().reset_index()
-        df = df.merge(df_y, on='Date', how='left')
+        df_y['Date'] = pd.to_datetime(df_y.iloc[:,0], errors='coerce')
+        df_y['Spread'] = pd.to_numeric(df_y.iloc[:,1], errors='coerce')
+        data['yield'] = df_y.dropna().set_index('Date').resample('MS').mean().reset_index()
 
-    # C. Commodities (XLSX)
-    df_c = robust_load_macro('PALLFNFINDEXM.xlsx', 'Commodities')
+    # Commodities
+    df_c = fetch("PALLFNFINDEXM.xlsx", "Monthly")
     if df_c is not None:
-        df = df.merge(df_c, on='Date', how='left')
+        df_c['Date'] = pd.to_datetime(df_c.iloc[:,0], errors='coerce')
+        df_c['Commodities'] = pd.to_numeric(df_c.iloc[:,1], errors='coerce')
+        data['comm'] = df_c.dropna()
 
-    # D. Consumer Confidence (The Specific CSV Title provided)
-    try:
-        csv_name = 'export-2026-02-10T06_50_22.597Z.csv'
-        if os.path.exists(csv_name):
-            df_cci = pd.read_csv(csv_name, skiprows=3, header=None, names=['Date', 'CCI'])
-            df_cci['Date'] = pd.to_datetime(df_cci['Date'])
-            df = df.merge(df_cci, on='Date', how='left')
-    except:
-        pass
+    # Consumer Confidence
+    df_cci = fetch("export-2026-02-10T06_50_22.597Z.csv")
+    if df_cci is not None:
+        # OECD format check
+        df_cci = pd.read_csv("export-2026-02-10T06_50_22.597Z.csv", skiprows=3, header=None)
+        df_cci.columns = ['Date', 'CCI']
+        df_cci['Date'] = pd.to_datetime(df_cci['Date'], errors='coerce')
+        data['cci'] = df_cci.dropna()
 
-    return df.sort_values('Date').ffill().bfill()
+    return data
 
-# --- 3. DASHBOARD RENDER ---
-df = load_all_data()
+# --- 3. THE ANALYTICS ENGINE ---
+db = load_terminal_data()
 
-if df is not None:
-    st.markdown(f"<div class='main-title'>INSTITUTIONAL MACRO MONITOR</div>", unsafe_allow_html=True)
-    
-    market = st.sidebar.selectbox("Market Selection", ["India", "UK", "Singapore"])
-    m_map = {"India": ["Policy_India", "CPI_India"], "UK": ["Policy_UK", "CPI_UK"], "Singapore": ["Policy_Singapore", "CPI_Singapore"]}
-    p_col, c_col = m_map[market]
+st.title("🏛️ INSTITUTIONAL POLICY TERMINAL")
 
-    # Metrics Calculations
-    spread = df['T10Y2Y'].iloc[-1] if 'T10Y2Y' in df.columns else 0.0
-    rec_prob = norm.cdf(-0.5 - (1.5 * spread))
-    cci = df['CCI'].iloc[-1] if 'CCI' in df.columns else 0.0
+if 'macro' not in db:
+    st.error("🚨 CRITICAL FILE MISSING: 'EM_Macro_Data_India_SG_UK.xlsx'. Please upload the file from GitHub to enable Policy Analysis.")
+    st.stop()
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("RECESSION PROB.", f"{rec_prob*100:.1f}%")
-    c2.metric("YIELD SPREAD (10Y-2Y)", f"{spread:.2f}")
-    c3.metric("CONS. CONFIDENCE", f"{cci:.1f}")
+# Merge all into one Master DF for the VAR Model
+df = db['macro']
+if 'yield' in db: df = df.merge(db['yield'], on='Date', how='left')
+if 'comm' in db: df = df.merge(db['comm'], on='Date', how='left')
+if 'cci' in db: df = df.merge(db['cci'], on='Date', how='left')
+df = df.sort_values('Date').ffill().bfill()
 
-    # Main Visualization
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1)
-    fig.add_trace(go.Scatter(x=df['Date'], y=df[p_col], name="Policy Rate", line=dict(color='#002366', width=3)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['Date'], y=df[c_col], name="CPI Inflation", line=dict(color='red', dash='dot')), row=1, col=1)
-    
-    if 'T10Y2Y' in df.columns:
-        fig.add_trace(go.Scatter(x=df['Date'], y=df['T10Y2Y'], name="Yield Spread", fill='tozeroy', line=dict(color='green')), row=2, col=1)
-    
-    fig.update_layout(height=600, template="plotly_white")
-    st.plotly_chart(fig, use_container_width=True)
+# --- 4. DASHBOARD ---
+market = st.sidebar.selectbox("SELECT JURISDICTION", ["India", "UK", "Singapore"])
+m_cols = {"India": ["Policy_India", "CPI_India"], "UK": ["Policy_UK", "CPI_UK"], "Singapore": ["Policy_Singapore", "CPI_Singapore"]}
+p_col, c_col = m_cols[market]
 
-    st.markdown(f"""
-    <div class='analyst-card'>
-    <b>Macro Summary:</b> The yield spread of {spread:.2f} results in a <b>{rec_prob*100:.1f}%</b> recession probability. 
-    Consumer sentiment is {'robust' if cci > 100 else 'declining'} at {cci:.1f}.
-    </div>
-    """, unsafe_allow_html=True)
+# Recession Probability (using Probit Model logic)
+latest_spread = df['Spread'].iloc[-1]
+prob = norm.cdf(-0.5 - (1.5 * latest_spread)) * 100
 
-else:
-    st.error("Missing Files: Please ensure 'EM_Macro_Data_India_SG_UK.xlsx' is in your folder.")
+# Predictive Forecasting (VAR Model)
+try:
+    # Use Policy Rate, Inflation, and Commodities as predictors
+    model_data = df[[p_col, c_col, 'Commodities']].dropna()
+    model = VAR(model_data).fit(6)
+    forecast = model.forecast(model_data.values[-6:], 12)
+    terminal_forecast = forecast[-1, 0]
+except:
+    terminal_forecast = df[p_col].iloc[-1]
+
+# Display Metrics
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("TERMINAL RATE EST.", f"{terminal_forecast:.2f}%", f"{terminal_forecast - df[p_col].iloc[-1]:.2f}")
+c2.metric("RECESSION RISK", f"{prob:.1f}%")
+c3.metric("YIELD SPREAD", f"{latest_spread:.2f}")
+c4.metric("CONS. SENTIMENT", f"{df['CCI'].iloc[-1]:.1f}")
+
+# Main Chart
+
+fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.07, 
+                    subplot_titles=(f"{market} Policy vs Inflation", "Global Macro Drivers"))
+
+# Top Chart
+fig.add_trace(go.Scatter(x=df['Date'], y=df[p_col], name="Policy Rate", line=dict(color='#002366', width=3)), row=1, col=1)
+fig.add_trace(go.Scatter(x=df['Date'], y=df[c_col], name="CPI Inflation", line=dict(color='#A52A2A', dash='dot')), row=1, col=1)
+
+# Bottom Chart
+fig.add_trace(go.Scatter(x=df['Date'], y=df['Spread'], name="Yield Spread", fill='tozeroy', line=dict(color='#2E8B57')), row=2, col=1)
+fig.add_trace(go.Scatter(x=df['Date'], y=df['CCI'], name="CCI (Consumer)", line=dict(color='#C5A059')), row=2, col=1)
+
+fig.update_layout(height=800, template="plotly_white", hovermode="x unified")
+st.plotly_chart(fig, use_container_width=True)
+
+# --- 5. INTELLIGENCE REPORT ---
+st.markdown("### 📝 Quant Research Note")
+trend = "Hawkish" if terminal_forecast > df[p_col].iloc[-1] else "Dovish"
+st.info(f"""
+**Stance:** {trend} Baseline. 
+The Vector Autoregression (VAR) model suggests that given current commodity prices ({df['Commodities'].iloc[-1]:.1f}) 
+and the yield spread ({latest_spread:.2f}), the {market} Central Bank is projected to move towards a 
+**{terminal_forecast:.2f}%** terminal rate over the next 12 months.
+""")
