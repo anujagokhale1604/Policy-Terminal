@@ -6,88 +6,95 @@ import plotly.express as px
 from statsmodels.tsa.api import VAR, MarkovAutoregression
 import os
 
-# --- 1. SYSTEM CONFIG ---
 st.set_page_config(page_title="Macro Quant Terminal v2", layout="wide", page_icon="🏛️")
 
 @st.cache_data(ttl=600)
 def load_macro_data():
     try:
-        # A. Global Commodities (Monthly)
-        df_comm = pd.read_excel("PALLFNFINDEXM.xlsx", sheet_name="Monthly")
-        df_comm.columns = [str(c).strip() for c in df_comm.columns]
-        df_comm['Date'] = pd.to_datetime(df_comm.iloc[:, 0])
-        comm = df_comm.set_index('Date').iloc[:, 0].rename("Commodities")
+        # 1. Global Commodities (Monthly)
+        # Using the specific sheet found in your uploaded PALLFNFINDEXM.xlsx
+        df_comm = pd.read_csv("PALLFNFINDEXM.xlsx - Monthly.csv") # Adjusted for CSV accessibility
+        df_comm['Date'] = pd.to_datetime(df_comm['observation_date'])
+        comm = df_comm.set_index('Date')['PALLFNFINDEXM'].rename("Commodities")
 
-        # B. Yield Spread (Daily -> Resample to Month-Start)
-        df_yield = pd.read_excel("T10Y2Y.xlsx", sheet_name="Daily")
-        df_yield.columns = [str(c).strip() for c in df_yield.columns]
-        df_yield['Date'] = pd.to_datetime(df_yield.iloc[:, 0])
-        yield_spread = pd.to_numeric(df_yield.set_index('Date').iloc[:, 0], errors='coerce').resample('MS').last().rename("Yield_Spread")
+        # 2. Yield Spread (Daily -> Monthly)
+        df_yield = pd.read_csv("T10Y2Y.xlsx - Daily.csv")
+        df_yield['Date'] = pd.to_datetime(df_yield['observation_date'])
+        # Critical Fix: Convert '.' or empty strings to NaN before numeric conversion
+        yield_spread = pd.to_numeric(df_yield['T10Y2Y'], errors='coerce')
+        yield_spread = pd.Series(yield_spread.values, index=df_yield['Date']).resample('MS').mean().rename("Yield_Spread")
 
-        # C. Global Sentiment (CSV - Monthly)
-        # Using skip=3 to bypass the OECD metadata headers
-        df_sent = pd.read_csv("export-2026-02-10T06_50_22.597Z.csv", skiprows=3, header=None, names=['Date', 'Sentiment'])
+        # 3. Sentiment (CSV - Monthly)
+        # Your export file has 3 rows of metadata
+        df_sent = pd.read_csv("export-2026-02-10T06_50_22.597Z.csv", skiprows=4, header=None, names=['Date', 'Sentiment'])
         df_sent['Date'] = pd.to_datetime(df_sent['Date'], errors='coerce')
         sentiment = df_sent.dropna().set_index('Date')['Sentiment'].rename("Sentiment")
 
-        # D. INR/USD Spot (Daily -> Resample to Month-Start)
-        df_inr = pd.read_excel("DEXINUS.xlsx", sheet_name="Daily")
-        df_inr.columns = [str(c).strip() for c in df_inr.columns]
-        df_inr['Date'] = pd.to_datetime(df_inr.iloc[:, 0])
-        inr_usd = pd.to_numeric(df_inr.set_index('Date').iloc[:, 0], errors='coerce').resample('MS').last().rename("INR_USD")
+        # 4. INR/USD Spot (Daily -> Monthly)
+        df_inr = pd.read_csv("DEXINUS.xlsx - Daily.csv")
+        df_inr['Date'] = pd.to_datetime(df_inr['observation_date'])
+        inr_usd = pd.to_numeric(df_inr['DEXINUS'], errors='coerce')
+        inr_usd = pd.Series(inr_usd.values, index=df_inr['Date']).resample('MS').mean().rename("INR_USD")
 
-        # --- DATA ALIGNMENT ---
-        # Inner join ensures the SVAR math has complete matrices for all dates
+        # --- THE ALIGNMENT GUARD ---
+        # Join all series and drop any row that has a NaN in ANY column
         combined = pd.concat([comm, yield_spread, sentiment, inr_usd], axis=1).sort_index()
         
-        # Institutional Forward-Fill: Handle holidays/missing daily prints before inner join
-        combined = combined.ffill().bfill().dropna()
+        # Linear interpolation fills small gaps, then we drop the remaining edges
+        combined = combined.interpolate(method='linear').dropna()
         
+        if len(combined) < 12:
+            return pd.DataFrame(), f"Insufficient Data Overlap: Only {len(combined)} months found."
+            
         return combined.reset_index().rename(columns={'index': 'Date'}), "Online"
     except Exception as e:
-        return pd.DataFrame(), str(e)
+        return pd.DataFrame(), f"Initialization Error: {str(e)}"
 
-# --- 2. ENGINE EXECUTION ---
+# --- 2. EXECUTION ---
 df, status = load_macro_data()
 
 st.title("🏛️ INSTITUTIONAL MACRO QUANT TERMINAL")
-st.caption(f"Status: {status} | Engine: SVAR(1) with Recursive Identification")
 
 if df.empty:
-    st.error("🏛️ TERMINAL OFFLINE: Data Alignment Error")
-    st.info("Verify filenames: PALLFNFINDEXM.xlsx, T10Y2Y.xlsx, export-2026-02-10T06_50_22.597Z.csv, DEXINUS.xlsx")
+    st.error(f"🏛️ TERMINAL OFFLINE: {status}")
     st.stop()
 
-# Ordering variables for Cholesky (Exogenous -> Endogenous)
+# Recursive ordering: Global Shocks -> Local Pricing
 cols = ['Commodities', 'Yield_Spread', 'Sentiment', 'INR_USD']
 
-# --- 3. THE ECONOMETRIC ENGINES ---
-# Engine A: Vector Autoregression (Bayesian Shrinkage via L=1)
-model_var = VAR(df[cols])
-res_var = model_var.fit(1)
+# --- 3. ECONOMETRICS ---
 
-# Engine B: Markov Switching (Volatility Regime Detection)
-res_ms = MarkovAutoregression(df['INR_USD'], k_regimes=2, order=1, switching_variance=True).fit()
-df['Regime_Prob'] = res_ms.smoothed_marginal_probabilities[1]
+try:
+    # We use a 1-month lag to capture immediate macro transmission
+    model_var = VAR(df[cols])
+    res_var = model_var.fit(1)
+    forecast = res_var.forecast(df[cols].values[-1:], 3)
+    
+    # Markov Switching for Regime Detection
+    res_ms = MarkovAutoregression(df['INR_USD'], k_regimes=2, order=1, switching_variance=True).fit()
+    df['Regime'] = res_ms.smoothed_marginal_probabilities[1]
+except Exception as e:
+    st.warning(f"Engine Warning: Falling back to Linear Drift due to: {e}")
+    forecast = np.tile(df[cols].iloc[-1].values, (3, 1))
+    df['Regime'] = 0
 
-# --- 4. DASHBOARD UI ---
-forecast = res_var.forecast(df[cols].values[-1:], 3)
-
+# --- 4. DASHBOARD ---
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("Spot Rate", f"₹{df['INR_USD'].iloc[-1]:.2f}")
-m2.metric("3M Projection", f"₹{forecast[-1, 3]:.2f}", f"{forecast[-1, 3] - df['INR_USD'].iloc[-1]:.2f}")
-m3.metric("State", "High Vol" if df['Regime_Prob'].iloc[-1] > 0.5 else "Stable")
-m4.metric("Dataset Span", f"{len(df)} Mo")
+m1.metric("INR/USD Spot", f"₹{df['INR_USD'].iloc[-1]:.2f}")
+m2.metric("3M VAR Forecast", f"₹{forecast[-1, 3]:.2f}")
+m3.metric("Regime Risk", f"{df['Regime'].iloc[-1]:.1%}")
+m4.metric("Engine", "SVAR-Cholesky")
 
 st.divider()
 
-t1, t2, t3, t4 = st.tabs(["📊 Regime Analysis", "🎯 Prediction Path", "⚡ Structural Shock", "📚 Framework"])
+t1, t2, t3 = st.tabs(["📊 Regime Analysis", "🎯 Predictive Path", "⚡ Structural Logic"])
 
 with t1:
+    
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df['Date'], y=df['INR_USD'], name="Spot", line=dict(color='#00FFAA')))
-    fig.add_trace(go.Scatter(x=df['Date'], y=df['Regime_Prob'], name="Risk Probability", fill='tozeroy', yaxis='y2', line=dict(color='rgba(255, 75, 75, 0.3)')))
-    fig.update_layout(template="plotly_dark", yaxis2=dict(overlaying='y', side='right', range=[0, 1], title="Regime Probability"))
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['Regime'], name="Volatility Regime", fill='tozeroy', yaxis='y2', line=dict(color='rgba(255, 75, 75, 0.3)')))
+    fig.update_layout(template="plotly_dark", yaxis2=dict(overlaying='y', side='right', range=[0, 1]))
     st.plotly_chart(fig, use_container_width=True)
 
 with t2:
@@ -95,20 +102,10 @@ with t2:
     f_vals = [df['INR_USD'].iloc[-1]] + list(forecast[:, 3])
     fig_f = go.Figure()
     fig_f.add_trace(go.Scatter(x=df['Date'].tail(24), y=df['INR_USD'].tail(24), name='Actual', line=dict(color='#00FFAA')))
-    fig_f.add_trace(go.Scatter(x=f_dates, y=f_vals, name='SVAR Forecast', line=dict(color='#FF00FF', dash='dash')))
-    st.plotly_chart(fig_f.update_layout(template="plotly_dark", title="24-Month History & 3-Month Projection"), use_container_width=True)
+    fig_f.add_trace(go.Scatter(x=f_dates, y=f_vals, name='Forecast', line=dict(color='#FF00FF', dash='dash')))
+    st.plotly_chart(fig_f.update_layout(template="plotly_dark"), use_container_width=True)
 
 with t3:
-    # Calculating Impulse Response: How does a 1-std-dev shock in Commodities affect INR?
-    irf = res_var.irf(periods=10).orth_irfs[:, 3, 0]
-    fig_irf = px.line(x=range(11), y=irf, title="Structural Response: Commodity Inflation Shock -> Rupee Impact", template="plotly_dark")
-    st.plotly_chart(fig_irf.update_traces(line_color='#FF4B4B', fill='tozeroy'), use_container_width=True)
-    st.info("This chart uses Cholesky identification to isolate the causal impact of global commodity prices on the INR/USD exchange rate.")
-
-with t4:
-    st.markdown("""
-    ### Institutional Methodology
-    * **Bayesian Stabilization**: The VAR is restricted to 1 lag to prevent overfitting and ensure stability across sparse monthly data.
-    * **Recursive Identification**: Variables are ordered $Commodities \\rightarrow Yields \\rightarrow Sentiment \\rightarrow INR$ to reflect the flow of global macro shocks.
-    * **Hidden Markov Model**: The regime detector separates 'Normal' volatility from 'Crisis' states based on the second-moment properties of the exchange rate.
-    """)
+    
+    irf = res_var.irf(periods=5).orth_irfs[:, 3, 0]
+    st.plotly_chart(px.line(x=range(6), y=irf, title="Impact of Commodity Shock on Rupee", template="plotly_dark").update_traces(line_color='#FF4B4B', fill='tozeroy'), use_container_width=True)
