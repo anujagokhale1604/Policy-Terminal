@@ -5,8 +5,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from statsmodels.tsa.api import VAR
 from statsmodels.tsa.regime_switching.markov_autoregression import MarkovAutoregression
-import urllib.request
-import json
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
@@ -70,10 +68,18 @@ FRED_BASE = "https://fred.stlouisfed.org/graph/fredgraph.csv?id="
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_fred(series_id):
-    """Fetch monthly data directly from FRED public CSV endpoint."""
+    """Fetch monthly data from FRED public CSV endpoint."""
+    import requests
     try:
         url = f"{FRED_BASE}{series_id}"
-        df = pd.read_csv(url, parse_dates=['DATE'], index_col='DATE')
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (compatible; research-app/1.0)',
+            'Accept': 'text/csv,application/csv,*/*',
+        }
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        from io import StringIO
+        df = pd.read_csv(StringIO(resp.text), parse_dates=['DATE'], index_col='DATE')
         df.index.name = 'date'
         df.columns = ['value']
         df['value'] = pd.to_numeric(df['value'], errors='coerce')
@@ -81,6 +87,7 @@ def fetch_fred(series_id):
         df = df.resample('MS').mean()
         return df['value']
     except Exception as e:
+        st.warning(f"Could not fetch FRED series {series_id}: {e}")
         return pd.Series(dtype=float)
 
 @st.cache_data(ttl=86400, show_spinner=False)
