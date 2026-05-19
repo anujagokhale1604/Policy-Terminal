@@ -336,13 +336,13 @@ with t1:
     # Historical — last 5 years
     hist = df['FX_Target'].iloc[-60:]
     fig.add_trace(go.Scatter(
-        x=hist.index, y=hist.values,
+        x=hist.index.strftime("%Y-%m-%d"), y=hist.values,
         name="Historical", line=dict(color='#8b949e', width=1.5),
         hovertemplate="%{x|%b %Y}: %{y:.4f}<extra></extra>"
     ))
 
     # Forecast path
-    x_fc = [last_date] + list(forecast_dates)
+    x_fc = [last_date.strftime("%Y-%m-%d")] + [d.strftime("%Y-%m-%d") for d in forecast_dates]
     y_fc = [current_spot] + list(path)
     fig.add_trace(go.Scatter(
         x=x_fc, y=y_fc,
@@ -357,7 +357,7 @@ with t1:
     lower = [v - resid_std * np.sqrt(i+1) for i, v in enumerate(path)]
 
     fig.add_trace(go.Scatter(
-        x=list(forecast_dates) + list(forecast_dates)[::-1],
+        x=[d.strftime("%Y-%m-%d") for d in forecast_dates] + [d.strftime("%Y-%m-%d") for d in forecast_dates][::-1],
         y=upper + lower[::-1],
         fill='toself', fillcolor=f"rgba(88,166,255,0.08)",
         line=dict(color='rgba(0,0,0,0)'),
@@ -366,11 +366,19 @@ with t1:
     ))
 
     # Vertical line at forecast start
-    fig.add_vline(x=last_date, line_dash="dot",
-                  line_color="#30363d", line_width=1,
-                  annotation_text="Forecast start",
-                  annotation_font_color="#8b949e",
-                  annotation_font_size=11)
+    # add_vline with annotation broken in newer plotly — use add_shape instead
+    fig.add_shape(
+        type="line",
+        x0=last_date.strftime("%Y-%m-%d"), x1=last_date.strftime("%Y-%m-%d"),
+        y0=0, y1=1, yref="paper",
+        line=dict(color="#30363d", width=1, dash="dot")
+    )
+    fig.add_annotation(
+        x=last_date.strftime("%Y-%m-%d"), y=1, yref="paper",
+        text="Forecast start", showarrow=False,
+        font=dict(color="#8b949e", size=11),
+        xanchor="left", xshift=4
+    )
 
     fig.update_layout(
         template="plotly_dark",
@@ -470,9 +478,9 @@ with t3:
     with col_b:
         st.markdown("**Commodity Index & Yield Spread**")
         fig_2 = make_subplots(specs=[[{"secondary_y": True}]])
-        fig_2.add_trace(go.Scatter(x=df.index, y=df['Commodities'],
+        fig_2.add_trace(go.Scatter(x=df.index.strftime("%Y-%m-%d"), y=df['Commodities'],
             name="Commodity Index", line=dict(color='#f0883e', width=1.5)), secondary_y=False)
-        fig_2.add_trace(go.Scatter(x=df.index, y=df['Yield_Spread'],
+        fig_2.add_trace(go.Scatter(x=df.index.strftime("%Y-%m-%d"), y=df['Yield_Spread'],
             name="10Y-2Y Spread", line=dict(color='#56d364', width=1.5, dash='dot')), secondary_y=True)
         fig_2.update_layout(
             template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)',
