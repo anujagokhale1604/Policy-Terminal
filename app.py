@@ -170,9 +170,14 @@ def fit_var_and_forecast(df, lags, horizon, y_shock_bps, c_shock_pct):
     model = VAR(df_std)
     result = model.fit(lags)
 
-    # Spectral radius (stability check)
-    companion = result.coefs_exog  # not what we want
-    sr = max(abs(np.linalg.eigvals(result.coef_summary().values[:lags*3, :3].reshape(-1, 3))))
+    # Spectral radius — check eigenvalues of companion matrix
+    # statsmodels VAR stores companion matrix via .coefs (shape: lags x k x k)
+    k = df_std.shape[1]
+    # Build companion matrix manually from VAR coefficients
+    coef_block = np.hstack([result.coefs[i] for i in range(lags)])  # k x (k*lags)
+    identity_block = np.eye(k * (lags - 1), k * lags) if lags > 1 else np.zeros((0, k * lags))
+    companion_mat = np.vstack([coef_block, identity_block])
+    sr = max(abs(np.linalg.eigvals(companion_mat)))
     stable = sr < 1.0
 
     # Build shock vector on last observed window
