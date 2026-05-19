@@ -9,6 +9,7 @@ from datetime import datetime
 import warnings
 import time
 import requests
+from io import StringIO
 
 warnings.filterwarnings("ignore")
 
@@ -66,7 +67,7 @@ MARKETS = {
     },
 }
 
-FRED_API_BASE = "https://api.stlouisfed.org/fred/series/observations"
+FRED_BASE = "https://fred.stlouisfed.org/graph/fredgraph.csv?id="
 
 
 class FredFetchError(Exception):
@@ -75,50 +76,38 @@ class FredFetchError(Exception):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_fred(series_id):
-    """Fetch data from the official FRED API with retries."""
-    api_key = st.secrets.get("FRED_API_KEY", "")
-
-    if not api_key:
-        raise FredFetchError(
-            "Missing FRED_API_KEY. Add it in Streamlit secrets before running the app."
-        )
-
-    params = {
-        "series_id": series_id,
-        "api_key": api_key,
-        "file_type": "json",
-        "observation_start": "2000-01-01",
-    }
+    """Fetch FRED data directly from the public CSV endpoint. No API key needed."""
+    url = f"{FRED_BASE}{series_id}"
 
     headers = {
-        "User-Agent": "macro-terminal/1.0",
-        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/csv,*/*",
     }
 
     last_error = None
 
-    for attempt in range(4):
+    for attempt in range(5):
         try:
             resp = requests.get(
-                FRED_API_BASE,
-                params=params,
+                url,
                 headers=headers,
-                timeout=(10, 60),
+                timeout=(10, 90),
             )
             resp.raise_for_status()
 
-            payload = resp.json()
-            observations = payload.get("observations", [])
+            df = pd.read_csv(
+                StringIO(resp.text),
+                parse_dates=["DATE"],
+                index_col="DATE",
+            )
 
-            if not observations:
-                raise FredFetchError(f"FRED returned no observations for {series_id}")
+            if df.empty or series_id not in df.columns:
+                raise FredFetchError(f"FRED returned no usable data for {series_id}")
 
-            df = pd.DataFrame(observations)
-            df["date"] = pd.to_datetime(df["date"])
+            df.index.name = "date"
+            df = df.rename(columns={series_id: "value"})
             df["value"] = pd.to_numeric(df["value"], errors="coerce")
-
-            df = df[["date", "value"]].dropna()
-            df = df.set_index("date").sort_index()
+            df = df.dropna()
 
             if df.empty:
                 raise FredFetchError(f"FRED series {series_id} contains no numeric values")
@@ -127,36 +116,27 @@ def fetch_fred(series_id):
 
         except Exception as e:
             last_error = e
-            time.sleep(2 ** attempt)
+            time.sleep(3 * (attempt + 1))
 
     raise FredFetchError(f"Could not fetch FRED series {series_id}: {last_error}")
 
 
 def load_all_data(market_name):
-    """Load FX, commodity, and yield data from FRED live."""
+    """Load FX, commodity, and yield data directly from FRED CSV."""
     fx_id = MARKETS[market_name]["fx_series"]
-
-    series_ids = {
-        "FX_Target": fx_id,
-        "Commodities": "PALLFNFINDEXM",
-        "Yield_Spread": "T10Y2Y",
-    }
 
     try:
         with st.spinner(f"Fetching live FRED data for {market_name}..."):
-            data = {
-                name: fetch_fred(series_id)
-                for name, series_id in series_ids.items()
-            }
+            fx = fetch_fred(fx_id)
+            comm = fetch_fred("PALLFNFINDEXM")
+            yld = fetch_fred("T10Y2Y")
+
     except FredFetchError as e:
         return None, str(e)
 
-    df = pd.concat(
-        [data["Commodities"], data["Yield_Spread"], data["FX_Target"]],
-        axis=1,
-    ).dropna()
-
+    df = pd.concat([comm, yld, fx], axis=1).dropna()
     df.columns = ["Commodities", "Yield_Spread", "FX_Target"]
+
     df = df[df.index >= "2010-01-01"]
 
     if len(df) < 36:
@@ -290,7 +270,7 @@ df, err = load_all_data(target)
 
 if err:
     st.error(f"Data error: {err}")
-    st.info("If you recently updated the code, clear Streamlit cache and reboot the app.")
+    st.info("FRED may be temporarily unavailable. Reboot the app or try again in a few minutes.")
     st.stop()
 
 try:
