@@ -493,7 +493,7 @@ with t3:
 
     st.markdown("**Summary Statistics**")
     st.dataframe(
-        df.describe().round(4).style.background_gradient(cmap='Blues', axis=0),
+        df.describe().round(4),
         use_container_width=True
     )
 
