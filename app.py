@@ -8,7 +8,6 @@ from statsmodels.tsa.regime_switching.markov_autoregression import MarkovAutoreg
 from datetime import datetime
 import warnings
 import time
-from io import StringIO
 import requests
 
 warnings.filterwarnings("ignore")
@@ -43,7 +42,6 @@ hr{border-color:#30363d}
 </style>
 """, unsafe_allow_html=True)
 
-# ── MARKET CONFIG ──────────────────────────────────────────────────────────────
 MARKETS = {
     "Singapore": {
         "fx_series": "EXSIUS",
@@ -68,7 +66,7 @@ MARKETS = {
     },
 }
 
-FRED_BASE = "https://fred.stlouisfed.org/graph/fredgraph.csv?id="
+FRED_API_BASE = "https://api.stlouisfed.org/fred/series/observations"
 
 
 class FredFetchError(Exception):
@@ -77,37 +75,50 @@ class FredFetchError(Exception):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_fred(series_id):
-    """Fetch monthly data from FRED public CSV endpoint with retries."""
-    url = f"{FRED_BASE}{series_id}"
+    """Fetch data from the official FRED API with retries."""
+    api_key = st.secrets.get("FRED_API_KEY", "")
+
+    if not api_key:
+        raise FredFetchError(
+            "Missing FRED_API_KEY. Add it in Streamlit secrets before running the app."
+        )
+
+    params = {
+        "series_id": series_id,
+        "api_key": api_key,
+        "file_type": "json",
+        "observation_start": "2000-01-01",
+    }
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; macro-terminal/1.0)",
-        "Accept": "text/csv,application/csv,*/*",
+        "User-Agent": "macro-terminal/1.0",
+        "Accept": "application/json",
     }
 
     last_error = None
 
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             resp = requests.get(
-                url,
+                FRED_API_BASE,
+                params=params,
                 headers=headers,
-                timeout=(10, 45),
+                timeout=(10, 60),
             )
             resp.raise_for_status()
 
-            df = pd.read_csv(
-                StringIO(resp.text),
-                parse_dates=["DATE"],
-                index_col="DATE",
-            )
+            payload = resp.json()
+            observations = payload.get("observations", [])
 
-            if df.empty or series_id not in df.columns:
-                raise FredFetchError(f"FRED returned no usable data for {series_id}")
+            if not observations:
+                raise FredFetchError(f"FRED returned no observations for {series_id}")
 
-            df.index.name = "date"
-            df = df.rename(columns={series_id: "value"})
+            df = pd.DataFrame(observations)
+            df["date"] = pd.to_datetime(df["date"])
             df["value"] = pd.to_numeric(df["value"], errors="coerce")
-            df = df.dropna()
+
+            df = df[["date", "value"]].dropna()
+            df = df.set_index("date").sort_index()
 
             if df.empty:
                 raise FredFetchError(f"FRED series {series_id} contains no numeric values")
@@ -121,7 +132,6 @@ def fetch_fred(series_id):
     raise FredFetchError(f"Could not fetch FRED series {series_id}: {last_error}")
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
 def load_all_data(market_name):
     """Load FX, commodity, and yield data from FRED live."""
     fx_id = MARKETS[market_name]["fx_series"]
@@ -167,16 +177,14 @@ def fit_var_and_forecast(df, lags, horizon, y_shock_bps, c_shock_pct):
     model = VAR(df_std)
     result = model.fit(lags)
 
-    # Correct VAR stability check
     stable = result.is_stable()
 
     last_obs = df_std.values[-lags:].copy()
 
-    # T10Y2Y is measured in percentage points, so 100 bps = 1.00
     last_obs[-1, 1] += (y_shock_bps / 100) / stds["Yield_Spread"]
 
-    # Commodity shock in standardized units
-    last_obs[-1, 0] += (c_shock_pct / 100) / stds["Commodities"]
+    commodity_delta = df["Commodities"].iloc[-1] * (c_shock_pct / 100)
+    last_obs[-1, 0] += commodity_delta / stds["Commodities"]
 
     fc_std = result.forecast(last_obs, horizon)
 
@@ -202,6 +210,7 @@ def fit_markov(series_std):
         current_prob = float(prob_stressed.iloc[-1])
 
         return prob_stressed, current_prob, True
+
     except Exception:
         return pd.Series(dtype=float), 0.0, False
 
@@ -215,7 +224,6 @@ def regime_chip(prob):
         return '<span class="regime-chip chip-stable">✓ STABLE</span>'
 
 
-# ── SIDEBAR ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown('<div class="terminal-title">Terminal Controls</div>', unsafe_allow_html=True)
     st.markdown("---")
@@ -277,13 +285,12 @@ with st.sidebar:
     st.caption("Gokhale (2026) · ssrn.com/abstract=6514338")
 
 
-# ── MAIN ───────────────────────────────────────────────────────────────────────
 cfg = MARKETS[target]
 df, err = load_all_data(target)
 
 if err:
     st.error(f"Data error: {err}")
-    st.info("FRED may be temporarily unavailable. Please clear cache and try again in a few minutes.")
+    st.info("If you recently updated the code, clear Streamlit cache and reboot the app.")
     st.stop()
 
 try:
@@ -307,7 +314,6 @@ last_date = df.index[-1]
 forecast_dates = pd.date_range(last_date, periods=horizon + 1, freq="MS")[1:]
 end_label = forecast_dates[-1].strftime("%b %Y")
 
-# ── HEADER ─────────────────────────────────────────────────────────────────────
 st.markdown(
     f'<div class="terminal-title">{cfg["flag"]} {target.upper()} QUANTITATIVE MACRO TERMINAL</div>',
     unsafe_allow_html=True
@@ -320,7 +326,6 @@ st.caption(
 
 st.markdown("---")
 
-# ── METRICS ROW ────────────────────────────────────────────────────────────────
 c1, c2, c3, c4, c5 = st.columns(5)
 
 c1.metric(
@@ -351,12 +356,11 @@ c4.metric(
 c5.metric(
     "DATA POINTS",
     f"{len(df)}",
-    f"months · 2010–{last_date.year}"
+    f"months · 2010-{last_date.year}"
 )
 
 st.markdown("---")
 
-# ── TABS ───────────────────────────────────────────────────────────────────────
 t1, t2, t3, t4 = st.tabs([
     "📈 Scenario Projection",
     "🔄 Regime Analysis",
@@ -370,6 +374,7 @@ with t1:
     fig = go.Figure()
 
     hist = df["FX_Target"].iloc[-60:]
+
     fig.add_trace(go.Scatter(
         x=hist.index,
         y=hist.values,
@@ -610,7 +615,7 @@ with t4:
         |--------|--------|-----------|
         | SGD/USD, INR/USD, USD/GBP | FRED | Monthly |
         | IMF Commodity Price Index | FRED: PALLFNFINDEXM | Monthly |
-        | US 10Y–2Y Treasury Spread | FRED: T10Y2Y | Monthly |
+        | US 10Y-2Y Treasury Spread | FRED: T10Y2Y | Monthly |
         """)
 
     st.markdown("---")
